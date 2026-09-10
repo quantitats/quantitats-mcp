@@ -2,8 +2,9 @@ import { randomBytes } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { endpointNamed, ENDPOINTS, type Endpoint } from "../src/catalogue.ts";
-import { call, prepare, RequestError } from "../src/client.ts";
+import { call, prepare, RateLimitedLocally, RequestError } from "../src/client.ts";
 import { DEFAULT_BASE_URL, type Config } from "../src/config.ts";
+import { BUCKETS, Limiter } from "../src/ratelimits.ts";
 import { hmacSigner } from "../src/signing.ts";
 import { startFakeApi, type FakeApi } from "./fake-api.ts";
 
@@ -170,6 +171,72 @@ describe("call", () => {
     const wrong: Config = { ...config, signer: hmacSigner(randomBytes(32).toString("base64")) };
     api.route("GET /v1/bots", { body: {} });
     await expect(call(wrong, endpoint("list_bots"), {})).rejects.toThrow(/does not verify/);
+  });
+});
+
+describe("rate limits", () => {
+  it("reports what the edge said is left of the window", async () => {
+    api.route("GET /v1/bots", {
+      body: { bots: [] },
+      headers: { "x-ratelimit-limit": "600", "x-ratelimit-remaining": "12", "x-ratelimit-reset": "37" },
+    });
+    const response = await call(config, endpoint("list_bots"), {});
+    expect(response.rateLimit).toEqual({ limit: 600, remaining: 12, resetSeconds: 37 });
+  });
+
+  it("says nothing when the route is not metered", async () => {
+    api.route("GET /v1/bots", { body: { bots: [] } });
+    expect((await call(config, endpoint("list_bots"), {})).rateLimit).toBeUndefined();
+  });
+
+  it("drops an unparseable header rather than reporting it as zero", async () => {
+    // "0 remaining" would tell a model to stop for a reason that is not true.
+    api.route("GET /v1/bots", { body: {}, headers: { "x-ratelimit-remaining": "soon" } });
+    expect((await call(config, endpoint("list_bots"), {})).rateLimit).toBeUndefined();
+  });
+
+  it("tells a 429 how long to wait", async () => {
+    api.route("GET /v1/trade/venues/binance_spot/ticker", {
+      status: 429,
+      body: { error: "too many market-data requests — this endpoint serves a cached copy" },
+      headers: { "x-ratelimit-reset": "1800" },
+    });
+    await expect(
+      call(config, endpoint("get_ticker"), { venue: "binance_spot", symbol: "BTCUSDT" }),
+    ).rejects.toThrow(/serves a cached copy.*window resets in 1800s/s);
+  });
+
+  it("refuses locally once its own budget is spent, without sending anything", async () => {
+    api.route("GET /v1/trade/venues/binance_spot/instruments", { body: { instruments: [] } });
+    const limiter = new Limiter();
+    for (let i = 0; i < BUCKETS.venuePublic.limit; i++) {
+      await call(config, endpoint("list_instruments"), { venue: "binance_spot" }, globalThis.fetch, limiter);
+    }
+    const sentSoFar = api.requests.length;
+    expect(sentSoFar).toBe(BUCKETS.venuePublic.limit);
+
+    const failure = await call(
+      config,
+      endpoint("list_instruments"),
+      { venue: "binance_spot" },
+      globalThis.fetch,
+      limiter,
+    ).catch((e) => e);
+    expect(failure).toBeInstanceOf(RateLimitedLocally);
+    expect((failure as RateLimitedLocally).bucket).toBe("venue-public");
+    expect((failure as RateLimitedLocally).retryAfterSeconds).toBeGreaterThan(0);
+    // Nothing was spent: the whole point of counting locally.
+    expect(api.requests).toHaveLength(sentSoFar);
+  });
+
+  it("counts a tool against the bucket its own path is metered in", async () => {
+    // list_venues is in the read bucket, so exhausting the market-data one must
+    // not stop it — the two are different rules at the edge.
+    api.route("GET /v1/trade/venues", { body: { venues: [] } });
+    const limiter = new Limiter();
+    for (let i = 0; i < BUCKETS.venuePublic.limit; i++) limiter.take(BUCKETS.venuePublic);
+    const response = await call(config, endpoint("list_venues"), {}, globalThis.fetch, limiter);
+    expect(response.status).toBe(200);
   });
 });
 

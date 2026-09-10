@@ -1,0 +1,10 @@
+node_modules
+dist
+coverage
+.git
+.github
+test
+*.md
+.env*
+*.pem
+.DS_Store

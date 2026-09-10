@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { BUCKETS, type Bucket } from "./ratelimits.ts";
+
 /**
  * Every endpoint an API key can reach, as a tool.
  *
@@ -94,12 +96,24 @@ export type Endpoint = {
   readonly body?: readonly string[];
   /** True for anything that changes state — hidden in read-only mode. */
   readonly write?: boolean;
+  /**
+   * Which of the edge's rate-limit buckets this path falls into.
+   *
+   * Stated per endpoint rather than derived from the path, because the edge's
+   * rules are not derivable from one: the same /v1/bots prefix is metered at 30
+   * a minute for a write and 600 for a read, and GET /v1/trade/venues sits in
+   * the default bucket while GET /v1/trade/venues/{venue}/ticker does not.
+   * Guessing that from a path is how a client ends up confidently wrong about
+   * its own budget.
+   */
+  readonly bucket: Bucket;
 };
 
 export const ENDPOINTS: readonly Endpoint[] = [
   // --- Bots ----------------------------------------------------------------
   {
     name: "list_bots",
+    bucket: BUCKETS.default,
     title: "List bots",
     description:
       "Every bot on the account: its state and run mode, the script it runs, and a summary of the fleet. " +
@@ -111,6 +125,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "create_bot",
+    bucket: BUCKETS.controlPlane,
     title: "Create a bot",
     description:
       "Creates and starts a bot running one of the account's scripts. Answers 409 if the name is taken and 403 " +
@@ -142,6 +157,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "stop_bot",
+    bucket: BUCKETS.controlPlane,
     title: "Stop a bot",
     description:
       "Stops the bot and retires it. Its orders and analytics remain readable afterwards. This does not cancel " +
@@ -154,6 +170,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "get_bot_config",
+    bucket: BUCKETS.default,
     title: "Read a bot's settings",
     description:
       "That bot's settings: the fields its script declares, the values this bot overrides, its run mode, its " +
@@ -165,6 +182,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "update_bot_config",
+    bucket: BUCKETS.controlPlane,
     title: "Replace a bot's settings",
     description:
       "Replaces the overrides — a full replacement, not a merge, so send every override the bot should keep — " +
@@ -183,6 +201,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "list_bot_orders",
+    bucket: BUCKETS.default,
     title: "List one bot's orders",
     description: "Every order that bot has placed, open and historic. Readable even for a bot that has been stopped.",
     scope: "bots:read",
@@ -200,6 +219,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "get_bot_analytics",
+    bucket: BUCKETS.default,
     title: "Read one bot's performance",
     description: "That bot's realized profit and loss and its fill statistics.",
     scope: "bots:read",
@@ -211,6 +231,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   // --- Market data ---------------------------------------------------------
   {
     name: "list_instruments",
+    bucket: BUCKETS.venuePublic,
     title: "List a venue's instruments",
     description:
       "Every symbol that venue lists, with its tick and lot rules. Public market structure — read this before " +
@@ -222,6 +243,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "get_ticker",
+    bucket: BUCKETS.venuePublic,
     title: "Get the current price",
     description: "The current price for one symbol on one venue.",
     scope: "market:read",
@@ -234,6 +256,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   // --- Trading -------------------------------------------------------------
   {
     name: "list_venues",
+    bucket: BUCKETS.default,
     title: "List venues",
     description:
       "The venue list and, for each, whether the account has keys stored for it and whether the plan permits it. " +
@@ -245,6 +268,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "list_open_orders",
+    bucket: BUCKETS.default,
     title: "List open orders",
     description:
       "Every order across the account that can still trade, from bots and from manual placement alike, each " +
@@ -264,6 +288,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "list_orders",
+    bucket: BUCKETS.default,
     title: "List order history",
     description:
       "The account's order history, filtered and paged. Page with the nextBefore the response carries.",
@@ -275,6 +300,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "list_venue_open_orders",
+    bucket: BUCKETS.venuePrivate,
     title: "List what a venue says is open",
     description:
       "One venue's own view of the account's resting orders, including any placed from the venue's own app. " +
@@ -287,6 +313,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "place_order",
+    bucket: BUCKETS.tradeWrite,
     title: "Place an order",
     description:
       "Submits one order and answers with it as the venue acknowledged it. Quantities and prices are decimal " +
@@ -312,6 +339,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "cancel_order",
+    bucket: BUCKETS.tradeWrite,
     title: "Cancel one order",
     description:
       "Withdraws one resting order, addressed by the client order id it has carried since it was filed — which " +
@@ -324,6 +352,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "cancel_orders",
+    bucket: BUCKETS.tradeWrite,
     title: "Cancel many orders",
     description:
       "Withdraws every open order matching the filter, and answers with what happened to each one. WITH NO " +
@@ -345,6 +374,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   // --- Scripts -------------------------------------------------------------
   {
     name: "list_scripts",
+    bucket: BUCKETS.default,
     title: "List scripts",
     description: "The account's strategy scripts, with the limits the editor enforces on them.",
     scope: "scripts:read",
@@ -354,6 +384,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "get_script",
+    bucket: BUCKETS.default,
     title: "Read a script",
     description: "One script's source, with when it was created and last changed.",
     scope: "scripts:read",
@@ -363,6 +394,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "get_script_config",
+    bucket: BUCKETS.default,
     title: "Read a script's settings",
     description:
       "The settings that script declares — each field's name, type, default and hint — which is what a bot " +
@@ -374,6 +406,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "create_script",
+    bucket: BUCKETS.controlPlane,
     title: "Create a script",
     description: "Stores a new strategy script. Answers 409 if the name is already in use.",
     scope: "scripts:write",
@@ -388,6 +421,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "update_script",
+    bucket: BUCKETS.controlPlane,
     title: "Replace a script",
     description:
       "Replaces a script's source. Bots already running it keep running the version they started with until " +
@@ -401,6 +435,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "delete_script",
+    bucket: BUCKETS.controlPlane,
     title: "Delete a script",
     description: "Removes a script from the account's library.",
     scope: "scripts:write",
@@ -413,6 +448,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   // --- Portfolio -----------------------------------------------------------
   {
     name: "list_balances",
+    bucket: BUCKETS.venuePrivate,
     title: "List balances",
     description: "Balances across every venue the account holds keys for.",
     scope: "portfolio:read",
@@ -422,6 +458,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "get_venue_balances",
+    bucket: BUCKETS.venuePrivate,
     title: "List one venue's balances",
     description: "Balances at one venue.",
     scope: "portfolio:read",
@@ -431,6 +468,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   },
   {
     name: "list_positions",
+    bucket: BUCKETS.venuePrivate,
     title: "List open positions",
     description: "Open derivative positions across the account.",
     scope: "portfolio:read",
@@ -442,6 +480,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
   // --- Streams -------------------------------------------------------------
   {
     name: "list_streams",
+    bucket: BUCKETS.wsTicket,
     title: "List live streams",
     description:
       "The live streams this deployment serves and the scope each needs. Discovery only — a stream is a long-" +

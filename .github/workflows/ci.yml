@@ -1,0 +1,456 @@
+# CI for Gitea Actions (the forge this repo lives on), written in GitHub Actions
+# syntax because Gitea reads both .gitea/workflows and .github/workflows.
+#
+# DO NOT ADD A .gitea/workflows DIRECTORY. Precedence is first-directory-exists-
+# wins rather than a merge: Gitea walks its configured workflow directories in
+# order and stops at the first one that resolves, so creating .gitea/workflows
+# would silently stop every file in here from running — while still counting as
+# a workflow path for change detection, so nothing would look broken.
+#
+# Three other forge differences are load-bearing below:
+#   - The built-in job token CANNOT publish to Gitea's container registry, so
+#     the push jobs use REGISTRY_USERNAME / REGISTRY_PASSWORD secrets (a
+#     personal access token) rather than anything automatic.
+#   - Gitea's registry is owner-scoped: {host}/{owner}/{image}, with no
+#     repository segment. GITHUB_REPOSITORY is already "owner/repo", so using
+#     it whole produces exactly that shape.
+#   - A computed matrix (`include: ${{ fromJSON(...) }}`) makes Gitea's parser
+#     panic, and a local composite action does not resolve `steps.*.outputs.*`
+#     on act_runner. So the two build jobs are near-identical by necessity —
+#     keep their step lists in step by hand.
+#
+# # Versioning
+#
+# One version per run, computed once by the `version` job and threaded through
+# every build as a --build-arg, so the tag on the image and the string the server
+# reports to a client are the same string. The rules are in scripts/version.mjs:
+#
+#   push of a v1.2.3 tag  -> 1.2.3         a release
+#   push to main          -> 0.1.0-dev.<commits>+<sha>
+#
+# Nothing here creates a tag. A release is a deliberate act — `git tag v1.2.3 &&
+# git push --tags` — and CI that tagged on its own would make the version history
+# a function of merge order rather than of anybody's decision.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The checks. Everything that can say "this is wrong" without a registry.
+  #
+  # `npm ci` rather than `npm install`: the lockfile is the whole point of a
+  # check job. An install that is free to resolve a different tree tests a tree
+  # nobody will ever run.
+  check:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The version is derived from the commit count and the tags, so a
+          # shallow clone would compute a different one every time the depth
+          # changed. See scripts/version.mjs.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      # Type errors first: they are the cheapest failure to produce and the one
+      # most likely to explain whatever the tests would have said next.
+      - name: Typecheck
+        run: npm run typecheck
+
+      # The suite is hermetic — an in-process API that really verifies signatures,
+      # no network. See test/fake-api.ts.
+      #
+      # It also holds two lines that nothing else can: test/ratelimits.test.ts
+      # reads deploy/gateway/ratelimit-api.yaml and fails if a figure there moved
+      # without moving here, and test/catalogue.test.ts pins every endpoint's
+      # scope against the published reference.
+      - name: Test
+        run: npm test
+
+      # Bundling is a check, not just a packaging step: esbuild resolves every
+      # import for real, so a dependency that only exists in devDependencies —
+      # or an ESM/CJS interop problem that tsc cannot see — fails here rather
+      # than at container start, in production, with no stack trace.
+      - name: Build
+        run: npm run build
+
+      - name: Report bundle size and version
+        run: |
+          set -euo pipefail
+          size=$(wc -c < dist/server.mjs)
+          printf '### Bundle\n\n`dist/server.mjs` is %s bytes (%s KiB), version `%s`\n' \
+            "$size" "$((size / 1024))" "$(node scripts/version.mjs)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # The version, computed once. Every build job and the manifest read it from
+  # here rather than deriving their own, because two derivations are two chances
+  # to disagree about what was built.
+  version:
+    name: Resolve version
+    needs: [check]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      released: ${{ steps.v.outputs.released }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - id: v
+        name: Derive the version from git
+        run: node scripts/version.mjs --github-output
+
+      - name: Say what will be published
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          TAG: ${{ steps.v.outputs.tag }}
+          RELEASED: ${{ steps.v.outputs.released }}
+        run: |
+          {
+            echo "### Version"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version stamped into the server | \`$VERSION\` |"
+            echo "| Image tag | \`$TAG\` |"
+            echo "| Release | \`$RELEASED\` |"
+            if [ "$RELEASED" != "true" ]; then
+              echo
+              echo "This is a development build. Push a \`v1.2.3\` tag to publish a release."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Which architectures to build. arm64 has to be skippable at the JOB level,
+  # because with no arm64 runner online a matrix leg does not fail — it queues
+  # until the whole run times out.
+  plan:
+    name: Plan build matrix
+    needs: [check]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest-amd64
+    outputs:
+      arm: ${{ steps.plan.outputs.arm }}
+      suffixes: ${{ steps.plan.outputs.suffixes }}
+    steps:
+      - id: plan
+        name: Decide which architectures to build
+        env:
+          BUILD_ARM_VAR: ${{ vars.BUILD_ARM }}
+        run: |
+          set -euo pipefail
+
+          want="${BUILD_ARM:-${BUILD_ARM_VAR:-}}"
+          case "$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')" in
+            true|1|yes|on) arm=true ;;
+            *)             arm=false ;;
+          esac
+
+          suffixes="amd64"
+          if [ "$arm" = true ]; then
+            suffixes="$suffixes arm64"
+          fi
+
+          echo "arm=$arm"           >> "$GITHUB_OUTPUT"
+          echo "suffixes=$suffixes" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Image build plan"
+            echo
+            echo "Architectures: \`$suffixes\`"
+            if [ "$arm" != true ]; then
+              echo
+              echo "arm64 is **skipped**. Set \`BUILD_ARM=true\` — in the runner's environment, or as a"
+              echo "repository variable — to build and publish it."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-amd64:
+    name: Build (linux/amd64)
+    needs: [check, version]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest-amd64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # A registry reference is a bare host[:port]. GITHUB_SERVER_URL carries a
+      # scheme, which buildx rejects as an invalid tag, so it is stripped.
+      # Set REGISTRY_OVERRIDE to push somewhere other than this forge.
+      - id: reg
+        name: Resolve registry and image name
+        env:
+          REGISTRY_OVERRIDE: ""
+        run: |
+          set -euo pipefail
+          registry="${REGISTRY_OVERRIDE:-$GITHUB_SERVER_URL}"
+          registry="${registry#*://}"   # strip scheme
+          registry="${registry%%/*}"    # strip any path, KEEP any :port
+          if [ "$registry" = "github.com" ]; then
+            registry="ghcr.io"          # GitHub's registry is not github.com
+          fi
+          image="$(printf '%s/%s/mcp' "$registry" "$GITHUB_REPOSITORY" \
+                   | tr '[:upper:]' '[:lower:]')"
+          echo "registry=$registry" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "Registry: $registry"
+          echo "Image:    $image"
+
+      # A runs-on label is a *request* for a matching host, not a guarantee.
+      # QEMU is deliberately never installed here, so an arch mismatch would
+      # otherwise surface as "exec format error" deep inside the build.
+      - name: Check runner is native
+        run: |
+          case "$(uname -m)" in
+            x86_64|amd64)  runner=amd64 ;;
+            aarch64|arm64) runner=arm64 ;;
+            *)             runner="$(uname -m)" ;;
+          esac
+          if [ "$runner" != "amd64" ]; then
+            echo "::error::Runner 'ubuntu-latest-amd64' reports arch $runner but this job \
+          builds linux/amd64. Images must be built natively."
+            exit 1
+          fi
+          echo "Runner is $runner — building linux/amd64 natively."
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.reg.outputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.reg.outputs.image }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # The version cannot be derived inside the image build: .dockerignore
+          # excludes .git, on purpose, so the repository is not in the context.
+          build-args: |
+            BUILD_VERSION=${{ needs.version.outputs.version }}
+          # A private per-arch tag keyed on the commit SHA, not a published one.
+          # merge-images stitches these into the real tags. (Gitea's artifact
+          # backend hard-errors on @actions/artifact v2+, so digests cannot be
+          # passed between jobs the usual way — both jobs derive this instead.)
+          tags: ${{ steps.reg.outputs.image }}:build-${{ github.sha }}-amd64
+          labels: ${{ steps.meta.outputs.labels }}
+          # Attestation manifests are rejected on push by older Gitea
+          # registries. Re-enable if yours (1.22+) handles them.
+          provenance: false
+          # Gitea Actions has no GitHub Actions cache service, so type=gha is
+          # out; registry-backed cache instead, one tag per architecture.
+          cache-from: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache-amd64
+          cache-to: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache-amd64,mode=max
+
+  build-arm64:
+    name: Build (linux/arm64)
+    needs: [check, version, plan]
+    if: >-
+      github.event_name == 'push'
+      && needs.plan.outputs.arm == 'true'
+    runs-on: ubuntu-latest-arm64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: reg
+        name: Resolve registry and image name
+        env:
+          REGISTRY_OVERRIDE: ""
+        run: |
+          set -euo pipefail
+          registry="${REGISTRY_OVERRIDE:-$GITHUB_SERVER_URL}"
+          registry="${registry#*://}"
+          registry="${registry%%/*}"
+          if [ "$registry" = "github.com" ]; then
+            registry="ghcr.io"
+          fi
+          image="$(printf '%s/%s/mcp' "$registry" "$GITHUB_REPOSITORY" \
+                   | tr '[:upper:]' '[:lower:]')"
+          echo "registry=$registry" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Check runner is native
+        run: |
+          case "$(uname -m)" in
+            x86_64|amd64)  runner=amd64 ;;
+            aarch64|arm64) runner=arm64 ;;
+            *)             runner="$(uname -m)" ;;
+          esac
+          if [ "$runner" != "arm64" ]; then
+            echo "::error::Runner 'ubuntu-latest-arm64' reports arch $runner but this job \
+          builds linux/arm64. Images must be built natively."
+            exit 1
+          fi
+          echo "Runner is $runner — building linux/arm64 natively."
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.reg.outputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.reg.outputs.image }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            BUILD_VERSION=${{ needs.version.outputs.version }}
+          tags: ${{ steps.reg.outputs.image }}:build-${{ github.sha }}-arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache-arm64
+          cache-to: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache-arm64,mode=max
+
+  # `always()` keeps a SKIPPED arm64 job from skipping this one too — which
+  # would build the amd64 image and never publish it. The explicit result checks
+  # put back what always() switched off: a real build failure must not publish.
+  merge-images:
+    name: Publish manifest
+    needs: [version, plan, build-amd64, build-arm64]
+    if: >-
+      always()
+      && github.event_name == 'push'
+      && needs.version.result == 'success'
+      && needs.plan.result == 'success'
+      && needs.build-amd64.result == 'success'
+      && needs.build-arm64.result != 'failure'
+      && needs.build-arm64.result != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - id: reg
+        name: Resolve registry and image name
+        env:
+          REGISTRY_OVERRIDE: ""
+        run: |
+          set -euo pipefail
+          registry="${REGISTRY_OVERRIDE:-$GITHUB_SERVER_URL}"
+          registry="${registry#*://}"
+          registry="${registry%%/*}"
+          if [ "$registry" = "github.com" ]; then
+            registry="ghcr.io"
+          fi
+          image="$(printf '%s/%s/mcp' "$registry" "$GITHUB_REPOSITORY" \
+                   | tr '[:upper:]' '[:lower:]')"
+          echo "registry=$registry" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.reg.outputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      # The published tags.
+      #
+      # `type=semver` fires only on a tag push, and gives the three references a
+      # consumer actually pins to: 1.2.3, 1.2 and 1. `latest` moves on either a
+      # release or a push to main, and the raw tag is the dev version — with its
+      # semver `+` already replaced, because a container reference may not carry
+      # one. See dockerTag in scripts/version.mjs.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.reg.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.version.outputs.tag }}
+
+      - name: Combine per-arch images into a manifest
+        shell: bash
+        env:
+          SUFFIXES: ${{ needs.plan.outputs.suffixes }}
+          IMAGE: ${{ steps.reg.outputs.image }}
+          SHA: ${{ github.sha }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          tag_args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && tag_args+=(--tag "$tag")
+          done <<< "$TAGS"
+
+          # `read -ra` rather than unquoted word-splitting: the failure mode of
+          # relying on the shell to split is one source named "…-amd64 arm64",
+          # which the registry has never heard of.
+          read -ra suffixes <<< "$SUFFIXES"
+          sources=()
+          for suffix in "${suffixes[@]}"; do
+            sources+=("$IMAGE:build-$SHA-$suffix")
+          done
+
+          echo "Publishing ${#sources[@]} architecture(s): $SUFFIXES"
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+
+      - name: Say what was published
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo "Version \`$VERSION\`, as:"
+            echo
+            while IFS= read -r tag; do
+              [ -n "$tag" ] && echo "- \`$tag\`"
+            done <<< "$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"

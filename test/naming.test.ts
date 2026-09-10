@@ -88,9 +88,9 @@ describe("what a client is shown", () => {
     }
   });
 
-  it("checks the README and the environment sample, which a user reads first", () => {
+  it("checks the README, the environment sample and the image, which a user reads first", () => {
     const root = join(import.meta.dirname, "..");
-    for (const file of ["README.md", ".env.example"]) {
+    for (const file of ["README.md", ".env.example", "Dockerfile"]) {
       const text = readFileSync(join(root, file), "utf8").toLowerCase();
       for (const name of denied) {
         expect(text, `${file} says "${name}"`).not.toContain(name);
@@ -116,6 +116,10 @@ describe("the product name", () => {
       "README.md",
       ".env.example",
       "package.json",
+      "Dockerfile",
+      ".dockerignore",
+      join(".github", "workflows", "ci.yml"),
+      ...readdirSync(join(root, "scripts")).map((f) => join("scripts", f)),
       ...readdirSync(join(root, "src")).map((f) => join("src", f)),
       // This file excepted: it has to name the word to check for it.
       ...readdirSync(join(root, "test"))

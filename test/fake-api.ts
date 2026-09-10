@@ -28,6 +28,8 @@ export type Route = {
   body?: unknown;
   /** Set to answer with something other than JSON, e.g. an HTML error page. */
   raw?: string;
+  /** Extra response headers, e.g. the edge's x-ratelimit-* counters. */
+  headers?: Record<string, string>;
 };
 
 export type FakeApi = {
@@ -111,15 +113,16 @@ export async function startFakeApi(credentials: {
       if (!route) return fail(404, "not found");
 
       const status = route.status ?? 200;
+      const extra = route.headers ?? {};
       if (status === 204) {
-        res.writeHead(204);
+        res.writeHead(204, extra);
         return res.end();
       }
       if (route.raw !== undefined) {
-        res.writeHead(status, { "content-type": "text/html" });
+        res.writeHead(status, { "content-type": "text/html", ...extra });
         return res.end(route.raw);
       }
-      res.writeHead(status, { "content-type": "application/json" });
+      res.writeHead(status, { "content-type": "application/json", ...extra });
       res.end(JSON.stringify(route.body ?? {}));
     });
   });

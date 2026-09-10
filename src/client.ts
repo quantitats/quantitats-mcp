@@ -1,5 +1,6 @@
 import type { Endpoint } from "./catalogue.ts";
 import type { Config } from "./config.ts";
+import { Limiter } from "./ratelimits.ts";
 import { signedHeaders } from "./signing.ts";
 
 /**
@@ -85,8 +86,67 @@ export function prepare(endpoint: Endpoint, args: Record<string, unknown>): Prep
   return { method: endpoint.method, path, query: query.toString(), body };
 }
 
+/**
+ * What the edge said about the caller's remaining allowance.
+ *
+ * Passed back to the model rather than only logged: a model that can see 4 left
+ * of 60 can stop, and one that cannot will find out by being refused.
+ */
+export type RateLimitState = {
+  readonly limit?: number;
+  readonly remaining?: number;
+  /** Seconds until the current window ends. */
+  readonly resetSeconds?: number;
+};
+
 /** What an endpoint answered with, decoded if it was JSON. */
-export type Response = { readonly status: number; readonly data: unknown };
+export type Response = {
+  readonly status: number;
+  readonly data: unknown;
+  readonly rateLimit?: RateLimitState;
+};
+
+/**
+ * Refused locally, before anything was sent.
+ *
+ * Distinct from a RequestError so a caller can tell "your own budget says wait"
+ * from "the server said wait" — the first costs nothing and the second has
+ * already been spent.
+ */
+export class RateLimitedLocally extends Error {
+  readonly retryAfterSeconds: number;
+  readonly bucket: string;
+
+  constructor(retryAfterSeconds: number, bucket: string, message: string) {
+    super(message);
+    this.retryAfterSeconds = retryAfterSeconds;
+    this.bucket = bucket;
+  }
+}
+
+/**
+ * The edge publishes its counters as x-ratelimit-*. Absent headers mean the
+ * request did not pass a metered route, not that the allowance is unlimited, so
+ * every field is optional and a missing one is reported as missing.
+ */
+function readRateLimit(headers: Headers): RateLimitState | undefined {
+  const state: { limit?: number; remaining?: number; resetSeconds?: number } = {};
+  const fields = [
+    ["x-ratelimit-limit", "limit"],
+    ["x-ratelimit-remaining", "remaining"],
+    ["x-ratelimit-reset", "resetSeconds"],
+  ] as const;
+
+  for (const [header, field] of fields) {
+    const raw = headers.get(header);
+    if (raw === null) continue;
+    const value = Number(raw);
+    // A header present but unparseable is dropped rather than reported as zero:
+    // "0 remaining" would tell a model to stop for a reason that is not true.
+    if (Number.isFinite(value)) state[field] = value;
+  }
+  return Object.keys(state).length > 0 ? state : undefined;
+}
 
 export type Fetch = typeof globalThis.fetch;
 
@@ -102,7 +162,23 @@ export async function call(
   endpoint: Endpoint,
   args: Record<string, unknown>,
   fetchImpl: Fetch = globalThis.fetch,
+  limiter?: Limiter,
 ): Promise<Response> {
+  // Before anything is signed or sent. The point of a local counter is to spend
+  // nothing on a request the published limits already say will be refused.
+  if (limiter) {
+    const verdict = limiter.take(endpoint.bucket);
+    if (!verdict.allowed) {
+      throw new RateLimitedLocally(
+        verdict.retryAfterSeconds,
+        endpoint.bucket.name,
+        `your own budget for the ${endpoint.bucket.name} group is spent — ${endpoint.bucket.limit} requests per ` +
+          `${endpoint.bucket.window} — so this was not sent. The window resets in ${verdict.retryAfterSeconds}s. ` +
+          endpoint.bucket.guidance,
+      );
+    }
+  }
+
   const prepared = prepare(endpoint, args);
   const headers: Record<string, string> = signedHeaders(
     config.signer,
@@ -145,10 +221,12 @@ export async function call(
     }
   }
 
+  const rateLimit = readRateLimit(response.headers);
+
   if (!response.ok) {
-    throw new RequestError(response.status, explain(response.status, data), url);
+    throw new RequestError(response.status, explain(response.status, data, rateLimit), url);
   }
-  return { status: response.status, data };
+  return { status: response.status, data, ...(rateLimit ? { rateLimit } : {}) };
 }
 
 /**
@@ -161,7 +239,7 @@ export async function call(
  * the account is allowed to do, and a 404 is as often an endpoint this
  * deployment does not serve as it is a missing bot.
  */
-function explain(status: number, data: unknown): string {
+function explain(status: number, data: unknown, rateLimit?: RateLimitState): string {
   const server =
     data !== null && typeof data === "object" && "error" in data && typeof (data as { error: unknown }).error === "string"
       ? (data as { error: string }).error
@@ -182,7 +260,12 @@ function explain(status: number, data: unknown): string {
       case 409:
         return "that name is already in use";
       case 429:
-        return "too many requests";
+        // The edge's own message names the figure and what to do instead, so the
+        // only thing to add is how long to wait — which is the one part a model
+        // cannot work out for itself.
+        return rateLimit?.resetSeconds !== undefined
+          ? `the rate limit for this endpoint is spent; the window resets in ${rateLimit.resetSeconds}s`
+          : "the rate limit for this endpoint is spent";
       default:
         return status >= 500 ? "the server failed to handle the request" : `the request failed with status ${status}`;
     }

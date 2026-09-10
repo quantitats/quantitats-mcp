@@ -5,8 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ENDPOINTS } from "../src/catalogue.ts";
 import type { Config } from "../src/config.ts";
+import { BUCKETS, Limiter } from "../src/ratelimits.ts";
 import { buildServer } from "../src/server.ts";
 import { hmacSigner } from "../src/signing.ts";
+import { VERSION } from "../src/version.ts";
 import { startFakeApi, type FakeApi } from "./fake-api.ts";
 
 /**
@@ -32,10 +34,13 @@ function config(overrides: Partial<Config> = {}): Config {
   };
 }
 
-async function connect(cfg: Config = config()): Promise<Client> {
+async function connect(cfg: Config = config(), limiter?: Limiter): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test", version: "0" });
-  await Promise.all([buildServer(cfg).connect(serverTransport), client.connect(clientTransport)]);
+  await Promise.all([
+    buildServer(cfg, globalThis.fetch, limiter).connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
   return client;
 }
 
@@ -182,7 +187,92 @@ describe("calling a tool", () => {
   });
 });
 
+describe("what a model is told about rate limits", () => {
+  it("states every tool's own limit in its description", async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    const byName = new Map(tools.map((t) => [t.name, t.description ?? ""]));
+    // Three orders of magnitude apart, and a model that has to guess which tool
+    // is which will guess wrong about the tightest one.
+    expect(byName.get("get_ticker")).toMatch(/60 requests per hour/);
+    expect(byName.get("place_order")).toMatch(/932 requests per minute/);
+    expect(byName.get("create_bot")).toMatch(/30 requests per minute/);
+    expect(byName.get("list_bots")).toMatch(/600 requests per minute/);
+    for (const tool of tools) {
+      expect(tool.description, tool.name).toMatch(/Rate limit: \d+ requests per (minute|hour)/);
+    }
+  });
+
+  it("says what to do instead of pushing at a limit", async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    const ticker = tools.find((t) => t.name === "get_ticker")?.description ?? "";
+    expect(ticker).toMatch(/read the venue's own public API/);
+  });
+
+  it("warns in the instructions that the limits differ, so nothing is polled", async () => {
+    const client = await connect();
+    const instructions = client.getInstructions() ?? "";
+    expect(instructions).toMatch(/rate limited per key/);
+    expect(instructions).toMatch(/do not poll/);
+  });
+
+  it("appends what is left of the window when it is worth acting on", async () => {
+    api.route("GET /v1/bots", {
+      body: { bots: [] },
+      headers: { "x-ratelimit-limit": "600", "x-ratelimit-remaining": "9", "x-ratelimit-reset": "12" },
+    });
+    const client = await connect();
+    const result = await client.callTool({ name: "list_bots", arguments: {} });
+    expect(textOf(result)).toMatch(/9 of 600 left in this window for the default group, resetting in 12s/);
+  });
+
+  it("stays quiet while there is plenty left", async () => {
+    // A note on every call trains a reader to skip the line, and then the one
+    // that matters is skipped too.
+    api.route("GET /v1/bots", {
+      body: { bots: [] },
+      headers: { "x-ratelimit-limit": "600", "x-ratelimit-remaining": "580" },
+    });
+    const client = await connect();
+    expect(textOf(await client.callTool({ name: "list_bots", arguments: {} }))).not.toMatch(/Rate limit:/);
+  });
+
+  it("refuses locally, saying nothing was spent and how long to wait", async () => {
+    api.route("GET /v1/trade/venues/binance_spot/instruments", { body: { instruments: [] } });
+    const limiter = new Limiter();
+    for (let i = 0; i < BUCKETS.venuePublic.limit; i++) limiter.take(BUCKETS.venuePublic);
+
+    const client = await connect(config(), limiter);
+    const result = await client.callTool({ name: "list_instruments", arguments: { venue: "binance_spot" } });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toMatch(/was not sent.*Nothing was spent/s);
+    expect(api.requests).toHaveLength(0);
+  });
+
+  it("shares one budget across the tools the edge meters together", async () => {
+    api.route("GET /v1/trade/venues/binance_spot/ticker", { body: { last: "1" } });
+    const limiter = new Limiter();
+    for (let i = 0; i < BUCKETS.venuePublic.limit; i++) limiter.take(BUCKETS.venuePublic);
+
+    const client = await connect(config(), limiter);
+    // Spent by list_instruments above; get_ticker is metered in the same bucket.
+    const result = await client.callTool({
+      name: "get_ticker",
+      arguments: { venue: "binance_spot", symbol: "BTCUSDT" },
+    });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toMatch(/venue-public/);
+  });
+});
+
 describe("what the server tells the model up front", () => {
+  it("reports the build's version, not a hardcoded one", async () => {
+    const client = await connect();
+    expect(client.getServerVersion()?.version).toBe(VERSION);
+    expect(client.getServerVersion()?.name).toBe("quantitats");
+  });
+
   it("says prices are strings and that writes move real money", async () => {
     const client = await connect();
     const instructions = client.getInstructions() ?? "";
