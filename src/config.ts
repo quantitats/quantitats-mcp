@@ -36,6 +36,15 @@ export const ENV = {
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
+/**
+ * The hosted API, which is where a request goes unless told otherwise.
+ *
+ * An origin, not an address: every endpoint hangs off /v1, so what is actually
+ * dialled and signed is https://api.quantitats.com/v1/bots and the rest. A
+ * self-hosted or staging deployment sets QUANTITATS_API_URL to its own origin.
+ */
+export const DEFAULT_BASE_URL = "https://api.quantitats.com";
+
 /** A configuration problem, phrased so the fix is in the message. */
 export class ConfigError extends Error {}
 
@@ -141,15 +150,16 @@ function parseScopes(raw: string | undefined): readonly string[] | undefined {
 }
 
 /**
- * The base URL, normalised to an origin with no trailing slash.
+ * The base URL, normalised to an origin with no trailing slash. Absent means the
+ * hosted API.
  *
  * The path is signed exactly as dialled, so a base carrying a path of its own
- * would put a segment in the URL that is not in the signed string. Refusing it
- * here turns that into a message at startup rather than a signature that never
- * verifies.
+ * would put a segment in the URL that is not in the signed string — including
+ * the /v1 the endpoints already carry. Refusing it here turns that into a
+ * message at startup rather than a signature that never verifies.
  */
 function parseBaseUrl(raw: string | undefined): string {
-  if (!raw) throw new ConfigError(`${ENV.baseUrl} is required, e.g. https://api.example.com`);
+  if (!raw) return DEFAULT_BASE_URL;
   let url: URL;
   try {
     url = new URL(raw);
@@ -161,8 +171,8 @@ function parseBaseUrl(raw: string | undefined): string {
   }
   if (url.pathname !== "/" || url.search || url.hash) {
     throw new ConfigError(
-      `${ENV.baseUrl} must be an origin with no path — every endpoint hangs off /v1, and a path here would ` +
-        `not be part of the string a request is signed over`,
+      `${ENV.baseUrl} must be an origin with no path, e.g. ${DEFAULT_BASE_URL} — every endpoint already ` +
+        `hangs off /v1, and a path here would not be part of the string a request is signed over`,
     );
   }
   return url.origin;

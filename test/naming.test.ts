@@ -72,7 +72,7 @@ describe("what a client is shown", () => {
 
   it("checks the server's instructions too, which are read before any call", () => {
     const server = buildServer({
-      baseUrl: "https://api.example.com",
+      baseUrl: "https://api.quantitats.com",
       keyId: "ak_test",
       signer: hmacSigner(Buffer.alloc(32).toString("base64")),
       timeoutMs: 1000,

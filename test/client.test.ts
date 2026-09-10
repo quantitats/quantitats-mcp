@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { endpointNamed, type Endpoint } from "../src/catalogue.ts";
+import { endpointNamed, ENDPOINTS, type Endpoint } from "../src/catalogue.ts";
 import { call, prepare, RequestError } from "../src/client.ts";
-import type { Config } from "../src/config.ts";
+import { DEFAULT_BASE_URL, type Config } from "../src/config.ts";
 import { hmacSigner } from "../src/signing.ts";
 import { startFakeApi, type FakeApi } from "./fake-api.ts";
 
@@ -66,6 +66,41 @@ describe("prepare", () => {
     const prepared = prepare(endpoint("update_bot_config"), { name: "alpha", config: { size: 2 } });
     expect(prepared.path).toBe("/v1/bots/alpha/config");
     expect(JSON.parse(new TextDecoder().decode(prepared.body))).toEqual({ config: { size: 2 } });
+  });
+});
+
+describe("the address a request is dialled at", () => {
+  /** The URL this client builds, assembled the way call() assembles it. */
+  function address(name: string, args: Record<string, unknown> = {}): string {
+    const prepared = prepare(endpoint(name), args);
+    return DEFAULT_BASE_URL + prepared.path + (prepared.query ? "?" + prepared.query : "");
+  }
+
+  it("is the published one", () => {
+    expect(address("list_bots")).toBe("https://api.quantitats.com/v1/bots");
+    expect(address("list_positions")).toBe("https://api.quantitats.com/v1/positions");
+    expect(address("get_bot_config", { name: "alpha" })).toBe("https://api.quantitats.com/v1/bots/alpha/config");
+    expect(address("get_ticker", { venue: "binance_spot", symbol: "BTCUSDT" })).toBe(
+      "https://api.quantitats.com/v1/trade/venues/binance_spot/ticker?symbol=BTCUSDT",
+    );
+  });
+
+  it("puts every endpoint under /v1 and nothing under /api", () => {
+    // /api is the internal prefix and is never what a caller dials or signs.
+    for (const endpoint of ENDPOINTS) {
+      const dialled = DEFAULT_BASE_URL + endpoint.path;
+      expect(dialled, endpoint.name).toMatch(/^https:\/\/api\.quantitats\.com\/v1\//);
+      expect(dialled, endpoint.name).not.toContain("/api/");
+    }
+  });
+
+  it("signs the same path it dials", async () => {
+    // The two are one string here, which is the property the whole scheme rests
+    // on: the fake rebuilds the canonical string from the path it received, so a
+    // mismatch is a refused signature rather than a passing test.
+    api.route("GET /v1/bots/alpha/analytics", { body: { realized: "0" } });
+    await call(config, endpoint("get_bot_analytics"), { name: "alpha" });
+    expect(api.requests.at(-1)?.path).toBe("/v1/bots/alpha/analytics");
   });
 });
 

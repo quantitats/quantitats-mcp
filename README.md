@@ -40,14 +40,21 @@ exists and the list tools answer the same questions.
 ## Configuration
 
 Every setting is an environment variable; see [`.env.example`](.env.example).
-The four that matter:
+Two are needed — the key id and its key material:
 
 ```
-QUANTITATS_API_URL=https://api.example.com
 QUANTITATS_API_KEY_ID=ak_...
 QUANTITATS_API_PRIVATE_KEY_FILE=/run/secrets/api-key.pem   # Ed25519, or:
 QUANTITATS_API_SECRET_FILE=/run/secrets/api-secret         # HMAC-SHA256
 ```
+
+Requests go to `https://api.quantitats.com/v1/*` — `list_bots` dials and signs
+`https://api.quantitats.com/v1/bots`. `QUANTITATS_API_URL` overrides the host for
+a self-hosted or staging deployment and takes an **origin with no path**: the
+`/v1` is on the endpoint, not the base, so one configuration cannot disagree with
+the paths the catalogue signs. A base carrying a path is refused at startup,
+because a segment that is in the dialled URL but not in the signed string is a
+signature that never verifies.
 
 Credentials are read from the environment, or better from a file the environment
 points at, and never from argv — an argv is readable by every process on the
@@ -85,7 +92,6 @@ Then point an MCP client at the built file:
       "command": "node",
       "args": ["/path/to/mcp/dist/server.mjs"],
       "env": {
-        "QUANTITATS_API_URL": "https://api.example.com",
         "QUANTITATS_API_KEY_ID": "ak_...",
         "QUANTITATS_API_SECRET_FILE": "/run/secrets/api-secret"
       }
@@ -119,8 +125,9 @@ classic way to break a signature, and this client does not.
 
 Two things are worth knowing if you are debugging a refusal:
 
-- The path signed is the **public** one. `/v1/bots` is what you dial and what you
-  sign; there is no prefix to add or strip.
+- The path signed is the **public** one. `https://api.quantitats.com/v1/bots` is
+  the address, `/v1/bots` is the second canonical line, and there is no prefix to
+  add or strip. The internal `/api` is never dialled or signed.
 - For an HMAC key the signing key is the **decoded** secret, not the base64 text
   you were shown. This client decodes it for you, and refuses text that is not
   base64 rather than signing with whatever could be salvaged from it.

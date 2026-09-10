@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { ConfigError, DEFAULT_TIMEOUT_MS, ENV, loadConfig } from "../src/config.ts";
+import { ConfigError, DEFAULT_BASE_URL, DEFAULT_TIMEOUT_MS, ENV, loadConfig } from "../src/config.ts";
 
 const SECRET = randomBytes(32).toString("base64");
 const { privateKey } = generateKeyPairSync("ed25519");
@@ -13,7 +13,7 @@ const PEM = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
 /** A minimal working environment, which each test then breaks in one way. */
 function env(overrides: Record<string, string | undefined> = {}) {
   return {
-    [ENV.baseUrl]: "https://api.example.com",
+    [ENV.baseUrl]: "https://api.quantitats.com",
     [ENV.keyId]: "ak_klzcmzngbqjnfciylwkq52ebgy",
     [ENV.secret]: SECRET,
     ...overrides,
@@ -29,7 +29,7 @@ function tempFile(name: string, contents: string): string {
 describe("loadConfig", () => {
   it("reads a working HMAC configuration", () => {
     const config = loadConfig(env());
-    expect(config.baseUrl).toBe("https://api.example.com");
+    expect(config.baseUrl).toBe("https://api.quantitats.com");
     expect(config.keyId).toBe("ak_klzcmzngbqjnfciylwkq52ebgy");
     expect(config.signer.alg).toBe("HMAC-SHA256");
     expect(config.timeoutMs).toBe(DEFAULT_TIMEOUT_MS);
@@ -91,27 +91,37 @@ describe("loadConfig", () => {
 });
 
 describe("the base URL", () => {
-  it("is required", () => {
-    expect(() => loadConfig(env({ [ENV.baseUrl]: undefined }))).toThrow(new RegExp(ENV.baseUrl));
+  it("defaults to the hosted API, so only the key has to be configured", () => {
+    expect(loadConfig(env({ [ENV.baseUrl]: undefined })).baseUrl).toBe("https://api.quantitats.com");
+    expect(DEFAULT_BASE_URL).toBe("https://api.quantitats.com");
+  });
+
+  it("is an origin, and the endpoints supply the /v1", () => {
+    // What is dialled and signed is https://api.quantitats.com/v1/bots. The
+    // version lives on the endpoint rather than in the base so that one
+    // configuration cannot disagree with the paths the catalogue signs.
+    expect(loadConfig(env({ [ENV.baseUrl]: undefined })).baseUrl).not.toContain("/v1");
   });
 
   it("is normalised to an origin", () => {
-    expect(loadConfig(env({ [ENV.baseUrl]: "https://api.example.com/" })).baseUrl).toBe("https://api.example.com");
+    expect(loadConfig(env({ [ENV.baseUrl]: "https://api.quantitats.com/" })).baseUrl).toBe("https://api.quantitats.com");
   });
 
-  it("refuses a base carrying a path", () => {
+  it("refuses a base carrying a path, /v1 included", () => {
     // A path here would put a segment in the dialled URL that is not in the
     // signed string, so this is a message at startup rather than a signature
-    // that never verifies.
-    expect(() => loadConfig(env({ [ENV.baseUrl]: "https://api.example.com/v1" }))).toThrow(/no path/);
+    // that never verifies. /v1 is the likeliest mistake — it is in every
+    // address a caller sees — and doubling it would dial /v1/v1/bots.
+    expect(() => loadConfig(env({ [ENV.baseUrl]: "https://api.quantitats.com/v1" }))).toThrow(/no path/);
+    expect(() => loadConfig(env({ [ENV.baseUrl]: "https://api.quantitats.com/v1/" }))).toThrow(/no path/);
   });
 
   it("refuses a scheme that is not http or https", () => {
-    expect(() => loadConfig(env({ [ENV.baseUrl]: "ws://api.example.com" }))).toThrow(/http or https/);
+    expect(() => loadConfig(env({ [ENV.baseUrl]: "ws://api.quantitats.com" }))).toThrow(/http or https/);
   });
 
   it("refuses text that is not a URL", () => {
-    expect(() => loadConfig(env({ [ENV.baseUrl]: "api.example.com" }))).toThrow(/not a URL/);
+    expect(() => loadConfig(env({ [ENV.baseUrl]: "api.quantitats.com" }))).toThrow(/not a URL/);
   });
 });
 

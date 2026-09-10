@@ -23,12 +23,20 @@ export type PreparedRequest = {
 };
 
 export class RequestError extends Error {
-  constructor(
-    readonly status: number,
-    readonly detail: string,
-    readonly url: string,
-  ) {
+  // Written out rather than declared as constructor parameter properties: those
+  // are one of the few TypeScript constructs Node's --experimental-strip-types
+  // cannot erase, and `npm run dev` runs these sources through exactly that. A
+  // bundler would have hidden it, so the tests would have stayed green while the
+  // dev script refused to start.
+  readonly status: number;
+  readonly detail: string;
+  readonly url: string;
+
+  constructor(status: number, detail: string, url: string) {
     super(detail);
+    this.status = status;
+    this.detail = detail;
+    this.url = url;
   }
 }
 
