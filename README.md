@@ -205,10 +205,19 @@ running while still looking fine.
   `latest`, `sha-<sha>` and the dev version.
 - **On a `v*` tag:** the same, tagged `1.2.3`, `1.2`, `1` and `latest`.
 
-Images are built **natively** per architecture and stitched into one manifest;
-no QEMU, and a job fails outright if its runner is not the architecture it is
-building for. arm64 is skipped unless `BUILD_ARM=true`, because with no arm64
-runner online a matrix leg does not fail — it queues until the run times out.
+**No job asks for an architecture-specific runner.** Every `runs-on` is
+`ubuntu-latest`, so any runner on the forge can take any job — a label like
+`ubuntu-latest-amd64` is a *request*, and with nothing carrying it a job does not
+fail, it queues until the whole run times out.
+
+The price is emulation: QEMU is installed and buildx builds every platform in one
+invocation, pushing the manifest directly. That is affordable here because
+nothing in this image is architecture-specific — the output is JavaScript, so an
+emulated build produces the same bytes as a native one and costs only time.
+
+arm64 is still opt-in, via `BUILD_ARM=true` as an environment or repository
+variable, because emulating it takes several times what amd64 does and most
+pushes do not need it.
 
 Publishing needs `REGISTRY_USERNAME` / `REGISTRY_PASSWORD` secrets; the built-in
 job token cannot write to Gitea's registry.

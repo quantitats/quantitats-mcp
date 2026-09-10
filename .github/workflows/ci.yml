@@ -16,8 +16,21 @@
 #     it whole produces exactly that shape.
 #   - A computed matrix (`include: ${{ fromJSON(...) }}`) makes Gitea's parser
 #     panic, and a local composite action does not resolve `steps.*.outputs.*`
-#     on act_runner. So the two build jobs are near-identical by necessity —
-#     keep their step lists in step by hand.
+#     on act_runner. Nothing below needs either any more — there is one build
+#     job — but do not reintroduce them.
+#
+# # Runners and architectures
+#
+# No job asks for an architecture-specific runner. Every `runs-on` is
+# `ubuntu-latest`, so any runner on the forge can pick up any job — a label like
+# `ubuntu-latest-amd64` is a *request*, and with no runner carrying it a job does
+# not fail, it queues until the run times out.
+#
+# The cost of that is emulation: one runner cannot natively build for an
+# architecture it is not. So QEMU is installed and buildx produces both platforms
+# in a single invocation, which also means the manifest is pushed directly and
+# there is nothing to stitch afterwards. arm64 under emulation is several times
+# slower than native, which is why it is still opt-in — see the `plan` job.
 #
 # # Versioning
 #
@@ -150,20 +163,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Which architectures to build. arm64 has to be skippable at the JOB level,
-  # because with no arm64 runner online a matrix leg does not fail — it queues
-  # until the whole run times out.
+  # Which architectures to build.
+  #
+  # A list of buildx platforms rather than a set of jobs: with emulation there is
+  # one build, and adding an architecture adds a platform to it. arm64 stays
+  # opt-in because emulating it costs several times what amd64 does, and most
+  # pushes do not need it.
   plan:
-    name: Plan build matrix
+    name: Plan build platforms
     needs: [check]
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest-amd64
+    runs-on: ubuntu-latest
     outputs:
+      platforms: ${{ steps.plan.outputs.platforms }}
       arm: ${{ steps.plan.outputs.arm }}
-      suffixes: ${{ steps.plan.outputs.suffixes }}
     steps:
       - id: plan
-        name: Decide which architectures to build
+        name: Decide which platforms to build
         env:
           BUILD_ARM_VAR: ${{ vars.BUILD_ARM }}
         run: |
@@ -175,30 +191,34 @@ jobs:
             *)             arm=false ;;
           esac
 
-          suffixes="amd64"
+          platforms="linux/amd64"
           if [ "$arm" = true ]; then
-            suffixes="$suffixes arm64"
+            platforms="$platforms,linux/arm64"
           fi
 
-          echo "arm=$arm"           >> "$GITHUB_OUTPUT"
-          echo "suffixes=$suffixes" >> "$GITHUB_OUTPUT"
+          echo "arm=$arm"             >> "$GITHUB_OUTPUT"
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
 
           {
             echo "### Image build plan"
             echo
-            echo "Architectures: \`$suffixes\`"
+            echo "Platforms: \`$platforms\`"
+            echo
+            echo "Built on whichever runner picks the job up, with QEMU for anything it is not"
+            echo "natively."
             if [ "$arm" != true ]; then
               echo
               echo "arm64 is **skipped**. Set \`BUILD_ARM=true\` — in the runner's environment, or as a"
-              echo "repository variable — to build and publish it."
+              echo "repository variable — to build and publish it. Expect it to take several times"
+              echo "longer than amd64, because it is emulated."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  build-amd64:
-    name: Build (linux/amd64)
-    needs: [check, version]
+  image:
+    name: Build and publish image
+    needs: [check, version, plan]
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest-amd64
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -227,164 +247,24 @@ jobs:
           echo "Registry: $registry"
           echo "Image:    $image"
 
-      # A runs-on label is a *request* for a matching host, not a guarantee.
-      # QEMU is deliberately never installed here, so an arch mismatch would
-      # otherwise surface as "exec format error" deep inside the build.
-      - name: Check runner is native
+      - name: Report what this runner is
+        env:
+          PLATFORMS: ${{ needs.plan.outputs.platforms }}
         run: |
           case "$(uname -m)" in
             x86_64|amd64)  runner=amd64 ;;
             aarch64|arm64) runner=arm64 ;;
             *)             runner="$(uname -m)" ;;
           esac
-          if [ "$runner" != "amd64" ]; then
-            echo "::error::Runner 'ubuntu-latest-amd64' reports arch $runner but this job \
-          builds linux/amd64. Images must be built natively."
-            exit 1
-          fi
-          echo "Runner is $runner — building linux/amd64 natively."
+          echo "Runner is $runner; building $PLATFORMS."
+          echo "Anything other than linux/$runner is emulated through QEMU."
 
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
+      # What makes an unlabelled runner able to build either architecture. It
+      # registers binfmt handlers for the foreign platforms, so a build for one
+      # runs under emulation instead of failing with "exec format error".
+      - uses: docker/setup-qemu-action@v3
         with:
-          registry: ${{ steps.reg.outputs.registry }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
-
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.reg.outputs.image }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          # The version cannot be derived inside the image build: .dockerignore
-          # excludes .git, on purpose, so the repository is not in the context.
-          build-args: |
-            BUILD_VERSION=${{ needs.version.outputs.version }}
-          # A private per-arch tag keyed on the commit SHA, not a published one.
-          # merge-images stitches these into the real tags. (Gitea's artifact
-          # backend hard-errors on @actions/artifact v2+, so digests cannot be
-          # passed between jobs the usual way — both jobs derive this instead.)
-          tags: ${{ steps.reg.outputs.image }}:build-${{ github.sha }}-amd64
-          labels: ${{ steps.meta.outputs.labels }}
-          # Attestation manifests are rejected on push by older Gitea
-          # registries. Re-enable if yours (1.22+) handles them.
-          provenance: false
-          # Gitea Actions has no GitHub Actions cache service, so type=gha is
-          # out; registry-backed cache instead, one tag per architecture.
-          cache-from: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache-amd64
-          cache-to: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache-amd64,mode=max
-
-  build-arm64:
-    name: Build (linux/arm64)
-    needs: [check, version, plan]
-    if: >-
-      github.event_name == 'push'
-      && needs.plan.outputs.arm == 'true'
-    runs-on: ubuntu-latest-arm64
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: reg
-        name: Resolve registry and image name
-        env:
-          REGISTRY_OVERRIDE: ""
-        run: |
-          set -euo pipefail
-          registry="${REGISTRY_OVERRIDE:-$GITHUB_SERVER_URL}"
-          registry="${registry#*://}"
-          registry="${registry%%/*}"
-          if [ "$registry" = "github.com" ]; then
-            registry="ghcr.io"
-          fi
-          image="$(printf '%s/%s/mcp' "$registry" "$GITHUB_REPOSITORY" \
-                   | tr '[:upper:]' '[:lower:]')"
-          echo "registry=$registry" >> "$GITHUB_OUTPUT"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-
-      - name: Check runner is native
-        run: |
-          case "$(uname -m)" in
-            x86_64|amd64)  runner=amd64 ;;
-            aarch64|arm64) runner=arm64 ;;
-            *)             runner="$(uname -m)" ;;
-          esac
-          if [ "$runner" != "arm64" ]; then
-            echo "::error::Runner 'ubuntu-latest-arm64' reports arch $runner but this job \
-          builds linux/arm64. Images must be built natively."
-            exit 1
-          fi
-          echo "Runner is $runner — building linux/arm64 natively."
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ steps.reg.outputs.registry }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
-
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.reg.outputs.image }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/arm64
-          push: true
-          build-args: |
-            BUILD_VERSION=${{ needs.version.outputs.version }}
-          tags: ${{ steps.reg.outputs.image }}:build-${{ github.sha }}-arm64
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: false
-          cache-from: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache-arm64
-          cache-to: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache-arm64,mode=max
-
-  # `always()` keeps a SKIPPED arm64 job from skipping this one too — which
-  # would build the amd64 image and never publish it. The explicit result checks
-  # put back what always() switched off: a real build failure must not publish.
-  merge-images:
-    name: Publish manifest
-    needs: [version, plan, build-amd64, build-arm64]
-    if: >-
-      always()
-      && github.event_name == 'push'
-      && needs.version.result == 'success'
-      && needs.plan.result == 'success'
-      && needs.build-amd64.result == 'success'
-      && needs.build-arm64.result != 'failure'
-      && needs.build-arm64.result != 'cancelled'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - id: reg
-        name: Resolve registry and image name
-        env:
-          REGISTRY_OVERRIDE: ""
-        run: |
-          set -euo pipefail
-          registry="${REGISTRY_OVERRIDE:-$GITHUB_SERVER_URL}"
-          registry="${registry#*://}"
-          registry="${registry%%/*}"
-          if [ "$registry" = "github.com" ]; then
-            registry="ghcr.io"
-          fi
-          image="$(printf '%s/%s/mcp' "$registry" "$GITHUB_REPOSITORY" \
-                   | tr '[:upper:]' '[:lower:]')"
-          echo "registry=$registry" >> "$GITHUB_OUTPUT"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
+          platforms: arm64,amd64
 
       - uses: docker/setup-buildx-action@v3
 
@@ -413,42 +293,42 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ needs.version.outputs.tag }}
 
-      - name: Combine per-arch images into a manifest
-        shell: bash
-        env:
-          SUFFIXES: ${{ needs.plan.outputs.suffixes }}
-          IMAGE: ${{ steps.reg.outputs.image }}
-          SHA: ${{ github.sha }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-
-          tag_args=()
-          while IFS= read -r tag; do
-            [ -n "$tag" ] && tag_args+=(--tag "$tag")
-          done <<< "$TAGS"
-
-          # `read -ra` rather than unquoted word-splitting: the failure mode of
-          # relying on the shell to split is one source named "…-amd64 arm64",
-          # which the registry has never heard of.
-          read -ra suffixes <<< "$SUFFIXES"
-          sources=()
-          for suffix in "${suffixes[@]}"; do
-            sources+=("$IMAGE:build-$SHA-$suffix")
-          done
-
-          echo "Publishing ${#sources[@]} architecture(s): $SUFFIXES"
-          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+      # One invocation, every platform, pushed straight to the real tags.
+      #
+      # A multi-platform build produces a manifest of its own, so there are no
+      # per-architecture tags to stitch together afterwards — which also disposes
+      # of the reason the digests used to be passed between jobs, something
+      # Gitea's artifact backend cannot do anyway.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ needs.plan.outputs.platforms }}
+          push: true
+          # The version cannot be derived inside the image build: .dockerignore
+          # excludes .git, on purpose, so the repository is not in the context.
+          build-args: |
+            BUILD_VERSION=${{ needs.version.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Attestation manifests are rejected on push by older Gitea
+          # registries. Re-enable if yours (1.22+) handles them.
+          provenance: false
+          # Gitea Actions has no GitHub Actions cache service, so type=gha is
+          # out; registry-backed cache instead. One ref for every platform — a
+          # multi-platform build stores its layers per platform underneath it.
+          cache-from: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.reg.outputs.image }}:buildcache,mode=max
 
       - name: Say what was published
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          PLATFORMS: ${{ needs.plan.outputs.platforms }}
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           {
             echo "### Published"
             echo
-            echo "Version \`$VERSION\`, as:"
+            echo "Version \`$VERSION\` for \`$PLATFORMS\`, as:"
             echo
             while IFS= read -r tag; do
               [ -n "$tag" ] && echo "- \`$tag\`"

@@ -2,14 +2,13 @@
 # -----------------------------------------------------------------------------
 # quantitats-mcp — a single bundled file on distroless/nodejs.
 # -----------------------------------------------------------------------------
-# The build is NATIVE, not cross-compiled, matching the other images published
-# from this project: CI builds each platform on a runner of that architecture
-# and fails a leg outright if the runner is not native, so there is no emulation
-# to avoid.
-#
-# Nothing here is architecture-specific — the output is JavaScript — but the
-# images are published as one manifest and built the same way so there is one
-# story about how images are produced.
+# Every platform is built by whichever runner picks the job up, with QEMU
+# standing in for anything that runner is not. That is affordable here in a way
+# it would not be for a compiler: nothing in this image is architecture-specific
+# — the output is JavaScript, and the only work is npm ci, tsc and esbuild — so
+# an emulated build produces byte-identical output to a native one and costs only
+# time. See .github/workflows/ci.yml, which builds both platforms in one
+# invocation and pushes the manifest directly.
 #
 # What this image IS: an MCP server that speaks JSON-RPC over stdin and stdout.
 # It listens on no port and serves no HTTP, so it is run the way a client
