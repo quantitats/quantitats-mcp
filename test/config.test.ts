@@ -21,7 +21,7 @@ function env(overrides: Record<string, string | undefined> = {}) {
 }
 
 function tempFile(name: string, contents: string): string {
-  const path = join(mkdtempSync(join(tmpdir(), "orchestrator-mcp-")), name);
+  const path = join(mkdtempSync(join(tmpdir(), "quantitats-mcp-")), name);
   writeFileSync(path, contents);
   return path;
 }

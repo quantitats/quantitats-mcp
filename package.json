@@ -1,12 +1,12 @@
 {
-  "name": "orchestrator-mcp",
+  "name": "quantitats-mcp",
   "version": "0.1.0",
   "private": true,
   "description": "An MCP server over the published trading API — every /v1 endpoint an API key can reach, as a tool.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "orchestrator-mcp": "dist/server.mjs"
+    "quantitats-mcp": "dist/server.mjs"
   },
   "engines": {
     "node": ">=22"

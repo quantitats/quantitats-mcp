@@ -4,7 +4,7 @@ import { visibleEndpoints, type Endpoint } from "./catalogue.ts";
 import { call, RequestError, type Fetch } from "./client.ts";
 import type { Config } from "./config.ts";
 
-export const SERVER_NAME = "orchestrator";
+export const SERVER_NAME = "quantitats";
 export const SERVER_VERSION = "0.1.0";
 
 /**

@@ -99,6 +99,36 @@ describe("what a client is shown", () => {
   });
 });
 
+/**
+ * The product is Quantitats. "orchestrator" is the internal name of the
+ * repository this package lives in, and it belongs nowhere in this package —
+ * not in the package name, not in an environment variable, not in the server
+ * name a client displays, not in a message written to a terminal.
+ *
+ * Checked over the whole tree rather than over the manifest alone, because the
+ * name would be just as wrong in a variable a user has to set as in a
+ * description they read.
+ */
+describe("the product name", () => {
+  it("is nowhere replaced by the repository's own name", () => {
+    const root = join(import.meta.dirname, "..");
+    const files = [
+      "README.md",
+      ".env.example",
+      "package.json",
+      ...readdirSync(join(root, "src")).map((f) => join("src", f)),
+      // This file excepted: it has to name the word to check for it.
+      ...readdirSync(join(root, "test"))
+        .filter((f) => f !== "naming.test.ts")
+        .map((f) => join("test", f)),
+    ];
+    for (const file of files) {
+      const text = readFileSync(join(root, file), "utf8");
+      expect(text.toLowerCase(), `${file} says "orchestrator"`).not.toContain("orchestrator");
+    }
+  });
+});
+
 describe("the source", () => {
   it("writes nothing to stdout, which carries JSON-RPC and nothing else", () => {
     // A stray console.log anywhere in this tree corrupts the transport, and the

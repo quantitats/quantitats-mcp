@@ -22,16 +22,16 @@ export type Config = {
 };
 
 export const ENV = {
-  baseUrl: "ORCHESTRATOR_API_URL",
-  keyId: "ORCHESTRATOR_API_KEY_ID",
-  alg: "ORCHESTRATOR_API_ALG",
-  privateKey: "ORCHESTRATOR_API_PRIVATE_KEY",
-  privateKeyFile: "ORCHESTRATOR_API_PRIVATE_KEY_FILE",
-  secret: "ORCHESTRATOR_API_SECRET",
-  secretFile: "ORCHESTRATOR_API_SECRET_FILE",
-  timeout: "ORCHESTRATOR_API_TIMEOUT_MS",
-  readOnly: "ORCHESTRATOR_MCP_READ_ONLY",
-  scopes: "ORCHESTRATOR_MCP_SCOPES",
+  baseUrl: "QUANTITATS_API_URL",
+  keyId: "QUANTITATS_API_KEY_ID",
+  alg: "QUANTITATS_API_ALG",
+  privateKey: "QUANTITATS_API_PRIVATE_KEY",
+  privateKeyFile: "QUANTITATS_API_PRIVATE_KEY_FILE",
+  secret: "QUANTITATS_API_SECRET",
+  secretFile: "QUANTITATS_API_SECRET_FILE",
+  timeout: "QUANTITATS_API_TIMEOUT_MS",
+  readOnly: "QUANTITATS_MCP_READ_ONLY",
+  scopes: "QUANTITATS_MCP_SCOPES",
 } as const;
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
@@ -73,7 +73,7 @@ function readMaybeFile(env: Env, inlineVar: string, fileVar: string): string | u
  * Chooses the signing primitive from what was supplied.
  *
  * Inferred when only one kind of key material is present, which is the ordinary
- * case; ORCHESTRATOR_API_ALG settles it when both are, rather than this picking
+ * case; QUANTITATS_API_ALG settles it when both are, rather than this picking
  * one and leaving the caller to wonder which key is in use.
  */
 function buildSigner(env: Env): Signer {

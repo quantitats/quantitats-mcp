@@ -1,4 +1,4 @@
-# orchestrator-mcp
+# quantitats-mcp
 
 An MCP server over the published trading API. Every `/v1` endpoint an API key
 can reach is a tool; the credentials come from the environment and never from a
@@ -43,10 +43,10 @@ Every setting is an environment variable; see [`.env.example`](.env.example).
 The four that matter:
 
 ```
-ORCHESTRATOR_API_URL=https://api.example.com
-ORCHESTRATOR_API_KEY_ID=ak_...
-ORCHESTRATOR_API_PRIVATE_KEY_FILE=/run/secrets/api-key.pem   # Ed25519, or:
-ORCHESTRATOR_API_SECRET_FILE=/run/secrets/api-secret         # HMAC-SHA256
+QUANTITATS_API_URL=https://api.example.com
+QUANTITATS_API_KEY_ID=ak_...
+QUANTITATS_API_PRIVATE_KEY_FILE=/run/secrets/api-key.pem   # Ed25519, or:
+QUANTITATS_API_SECRET_FILE=/run/secrets/api-secret         # HMAC-SHA256
 ```
 
 Credentials are read from the environment, or better from a file the environment
@@ -55,12 +55,12 @@ machine and lands in shell history, while an MCP client launches this process
 with an env block of its own.
 
 The algorithm is inferred from whichever key material is present, and
-`ORCHESTRATOR_API_ALG` settles it only when both are.
+`QUANTITATS_API_ALG` settles it only when both are.
 
 Two optional narrowings, both off by default:
 
-- `ORCHESTRATOR_MCP_READ_ONLY=true` hides every tool that changes anything.
-- `ORCHESTRATOR_MCP_SCOPES=bots:read,trade:read` advertises only the tools those
+- `QUANTITATS_MCP_READ_ONLY=true` hides every tool that changes anything.
+- `QUANTITATS_MCP_SCOPES=bots:read,trade:read` advertises only the tools those
   scopes reach. A key's scopes cannot be read back from any endpoint, so this is
   stated rather than fetched; leaving it unset advertises everything and lets the
   server refuse.
@@ -81,13 +81,13 @@ Then point an MCP client at the built file:
 ```json
 {
   "mcpServers": {
-    "orchestrator": {
+    "quantitats": {
       "command": "node",
       "args": ["/path/to/mcp/dist/server.mjs"],
       "env": {
-        "ORCHESTRATOR_API_URL": "https://api.example.com",
-        "ORCHESTRATOR_API_KEY_ID": "ak_...",
-        "ORCHESTRATOR_API_SECRET_FILE": "/run/secrets/api-secret"
+        "QUANTITATS_API_URL": "https://api.example.com",
+        "QUANTITATS_API_KEY_ID": "ak_...",
+        "QUANTITATS_API_SECRET_FILE": "/run/secrets/api-secret"
       }
     }
   }

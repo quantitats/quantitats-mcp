@@ -16,7 +16,7 @@ async function main(): Promise<void> {
     config = loadConfig();
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`orchestrator-mcp: ${err.message}\n`);
+      process.stderr.write(`quantitats-mcp: ${err.message}\n`);
       process.exit(2);
     }
     throw err;
@@ -33,6 +33,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  process.stderr.write(`orchestrator-mcp: ${(err as Error).stack ?? String(err)}\n`);
+  process.stderr.write(`quantitats-mcp: ${(err as Error).stack ?? String(err)}\n`);
   process.exit(1);
 });
