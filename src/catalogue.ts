@@ -515,7 +515,9 @@ export const ENDPOINTS: readonly Endpoint[] = [
     name: "create_script",
     bucket: BUCKETS.controlPlane,
     title: "Create a script",
-    description: "Stores a new strategy script. Answers 409 if the name is already in use.",
+    description:
+      "Stores a new strategy script. Answers 409 if the name is already in use and 403 if the plan's script " +
+      "allowance is used, naming the plan and the count. Editing or deleting a script is never counted.",
     scope: "scripts:write",
     method: "POST",
     path: "/v1/scripts",
