@@ -226,7 +226,10 @@ export const ENDPOINTS: readonly Endpoint[] = [
       name: z
         .string()
         .min(1)
-        .describe("Name for the new bot. Must be unused. Stored lower-cased; later tools take the name this answers with."),
+        .describe(
+          "Name for the new bot: 3 to 22 characters of lowercase letters, digits and dashes, starting and ending " +
+            "with a letter or digit. Must be unused. Stored lower-cased; later tools take the name this answers with.",
+        ),
       script: scriptName,
       exchanges: z.array(venue).min(1).describe("Venues this bot trades on."),
       mode: z.enum(["paper", "live"]).optional().describe("Paper simulates; live trades real funds. Defaults to paper."),
