@@ -25,6 +25,15 @@ whole surface:
 A scope is not implied by another: a key that lists and starts bots needs both
 `bots:read` and `bots:write`.
 
+Arguments use the API's own vocabulary, not a friendlier one, because the API is
+strict where it matters: an order's side is `BUY` or `SELL`, a status filter is
+one of the upper-case statuses, and an order type is one of the seven the API
+places (`MARKET`, `LIMIT`, `LIMIT_MAKER`, `STOP_LOSS`, `STOP_LOSS_LIMIT`,
+`TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`). A bot's name is trimmed and lower-cased
+before it goes into a path, as the API stores it — a stop addressed to `Alpha`
+would otherwise answer 204 and stop nothing. `list_open_orders` takes no
+filters, because its route reads none; `list_orders` is the one that filters.
+
 ## Rate limits
 
 The edge meters the published API per key, in six buckets, and the figures differ
@@ -257,7 +266,7 @@ Two things are worth knowing if you are debugging a refusal:
 npm test
 ```
 
-89 tests, all hermetic — nothing reaches the network or a real deployment.
+162 tests, all hermetic — nothing reaches the network or a real deployment.
 
 The two that carry the most weight:
 
@@ -278,7 +287,9 @@ The two that carry the most weight:
 `test/catalogue.test.ts` holds the other line: the method, path and scope of
 every tool, copied from the published endpoint reference rather than derived
 from the catalogue, so a guard that moves in the API shows up here as a failure
-rather than as a 403 someone hits later.
+rather than as a 403 someone hits later. Its "what the API accepts" block does the
+same for the argument schemas — the sides, statuses, order types and loss-limit
+shapes the handlers take, and a bot's name as they store it.
 
 `test/naming.test.ts` checks the tool manifest the server actually serves —
 every title, description and argument description, plus the instructions a

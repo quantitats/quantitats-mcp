@@ -80,6 +80,17 @@ describe("the tool manifest", () => {
     }
   });
 
+  it("spells every schema out inline, with no $ref a client would have to resolve", async () => {
+    // One schema instance used twice in a tool is converted once and referenced
+    // after that — a loss limit described as "#/properties/sim" — and not every
+    // client follows a reference.
+    const client = await connect();
+    const { tools } = await client.listTools();
+    for (const tool of tools) {
+      expect(JSON.stringify(tool.inputSchema), tool.name).not.toContain("$ref");
+    }
+  });
+
   it("marks reads as read-only and destructive writes as destructive", async () => {
     const client = await connect();
     const { tools } = await client.listTools();
@@ -128,8 +139,8 @@ describe("calling a tool", () => {
       arguments: {
         exchange: "binance_perpetual",
         symbol: "BTCUSDT",
-        side: "sell",
-        type: "limit",
+        side: "SELL",
+        type: "LIMIT",
         quantity: "0.5",
         price: "61000",
         reduceOnly: true,
@@ -141,6 +152,89 @@ describe("calling a tool", () => {
     expect(sent?.method).toBe("POST");
     expect(sent?.path).toBe("/v1/trade/orders");
     expect(JSON.parse(sent?.body ?? "")).toMatchObject({ exchange: "binance_perpetual", reduceOnly: true });
+  });
+
+  it("places an order that needs a trigger price, which market and limit alone could not", async () => {
+    api.route("POST /v1/trade/orders", { status: 201, body: { order: { clientOrderId: "c-2" } } });
+    const client = await connect();
+    const result = await client.callTool({
+      name: "place_order",
+      arguments: {
+        exchange: "binance_spot",
+        symbol: "BTCUSDT",
+        side: "SELL",
+        type: "STOP_LOSS_LIMIT",
+        quantity: "0.01",
+        price: "58000",
+        stopPrice: "58500",
+        timeInForce: "GTC",
+      },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(JSON.parse(api.requests.at(-1)?.body ?? "")).toMatchObject({
+      type: "STOP_LOSS_LIMIT",
+      stopPrice: "58500",
+      timeInForce: "GTC",
+    });
+  });
+
+  it("refuses a lower-case side before dialling, rather than sending one a filter would 400", async () => {
+    const client = await connect();
+    const result = await client.callTool({ name: "list_orders", arguments: { side: "buy" } });
+    expect(result.isError).toBe(true);
+    expect(api.requests).toHaveLength(0);
+  });
+
+  it("stops a bot by the name the API stores, whatever spelling the model used", async () => {
+    // The API answers a stop for a name it cannot form with 204 and does nothing,
+    // so the spelling a model typed would report success on a bot still trading.
+    api.route("DELETE /v1/bots/alpha", { status: 204 });
+    const client = await connect();
+    const result = await client.callTool({ name: "stop_bot", arguments: { name: " Alpha " } });
+    expect(result.isError).toBeFalsy();
+    expect(api.requests.map((r) => `${r.method} ${r.path}`)).toEqual(["DELETE /v1/bots/alpha"]);
+  });
+
+  it("sends update_script's name in the body as well as the path", async () => {
+    api.route("PUT /v1/scripts/grid", { body: { name: "grid" } });
+    const client = await connect();
+    const result = await client.callTool({ name: "update_script", arguments: { name: "grid", script: "return 1" } });
+    expect(result.isError).toBeFalsy();
+    expect(JSON.parse(api.requests.at(-1)?.body ?? "")).toEqual({ name: "grid", script: "return 1" });
+  });
+
+  it("sends no filters to list_open_orders, whose route reads none", async () => {
+    api.route("GET /v1/trade/orders/open", { body: { orders: [] } });
+    const client = await connect();
+    const result = await client.callTool({ name: "list_open_orders", arguments: { symbol: "BTCUSDT", side: "BUY" } });
+    expect(result.isError).toBeFalsy();
+    expect(api.requests.at(-1)?.query).toBe("");
+  });
+
+  it("sends a time window on one bot's orders", async () => {
+    api.route("GET /v1/bots/alpha/orders", { body: { orders: [] } });
+    const client = await connect();
+    const result = await client.callTool({
+      name: "list_bot_orders",
+      arguments: { name: "alpha", status: "FILLED", since: "2026-09-01T00:00:00Z", until: "2026-09-08T00:00:00Z" },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(Object.fromEntries(new URLSearchParams(api.requests.at(-1)?.query))).toEqual({
+      status: "FILLED",
+      since: "2026-09-01T00:00:00Z",
+      until: "2026-09-08T00:00:00Z",
+    });
+  });
+
+  it("accepts a loss limit as a bare number, which the API takes as well as the object form", async () => {
+    api.route("PUT /v1/bots/alpha/config", { body: { killSwitch: 250 } });
+    const client = await connect();
+    const result = await client.callTool({
+      name: "update_bot_config",
+      arguments: { name: "alpha", config: {}, killSwitch: 250 },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(JSON.parse(api.requests.at(-1)?.body ?? "")).toEqual({ config: {}, killSwitch: 250 });
   });
 
   it("reports a 204 as done rather than as empty JSON", async () => {

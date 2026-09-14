@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { ENDPOINTS, SCOPES, VENUES, visibleEndpoints, type Endpoint } from "../src/catalogue.ts";
+import { endpointNamed, ENDPOINTS, SCOPES, VENUES, visibleEndpoints, type Endpoint } from "../src/catalogue.ts";
 
 /**
  * The catalogue is the published contract restated on this side, and the tests
@@ -126,6 +126,150 @@ describe("the catalogue", () => {
     // /api is internal and is never what a caller signs.
     for (const endpoint of ENDPOINTS) {
       expect(endpoint.path.startsWith("/v1/"), endpoint.name).toBe(true);
+    }
+  });
+});
+
+/**
+ * The argument schemas against what the API's handlers accept.
+ *
+ * Every case here is a request the catalogue once described and the API refused
+ * or ignored — a 400 for a lower-case filter, a 204 that stopped nothing, a
+ * filter silently dropped. The accepted vocabularies are copied by hand from the
+ * endpoint reference for the same reason the table above is: reading them back
+ * out of the catalogue would prove only that the catalogue agrees with itself.
+ */
+describe("what the API accepts", () => {
+  const named = (name: string): Endpoint => {
+    const endpoint = endpointNamed(name);
+    if (!endpoint) throw new Error(`no tool ${name}`);
+    return endpoint;
+  };
+  const described = (endpoint: Endpoint, arg: string) =>
+    (endpoint.input[arg] as { description?: string } | undefined)?.description ?? "";
+
+  it("sends update_script's name in the body too, which the API requires", () => {
+    // The API reads the name a script should end up with from the body and
+    // refuses a body without one ("a script needs a name"); the path only says
+    // which script. So the one argument fills the placeholder and the body both.
+    const update = named("update_script");
+    expect(update.path).toBe("/v1/scripts/{name}");
+    expect(update.body).toEqual(["name", "script"]);
+  });
+
+  it("puts no other argument in two places", () => {
+    const twice = new Set(["update_script.name"]);
+    for (const endpoint of ENDPOINTS) {
+      const placeholders = new Set([...endpoint.path.matchAll(/\{(\w+)\}/g)].map((m) => m[1]));
+      for (const name of Object.keys(endpoint.input)) {
+        const places = [placeholders.has(name), (endpoint.query ?? []).includes(name), (endpoint.body ?? []).includes(name)];
+        const where = `${endpoint.name}.${name}`;
+        expect(places.filter(Boolean).length, where).toBe(twice.has(where) ? 2 : 1);
+      }
+    }
+  });
+
+  it("spells side BUY or SELL everywhere, as the order filters and the reference do", () => {
+    const withSide = ENDPOINTS.filter((e) => e.input.side);
+    expect(withSide.map((e) => e.name).sort()).toEqual(["list_bot_orders", "list_orders", "place_order"]);
+    for (const endpoint of withSide) {
+      const side = endpoint.input.side;
+      expect(side?.safeParse("BUY").success, endpoint.name).toBe(true);
+      expect(side?.safeParse("SELL").success, endpoint.name).toBe(true);
+      expect(side?.safeParse("buy").success, endpoint.name).toBe(false);
+    }
+  });
+
+  it("filters status on the API's exact list and nothing else", () => {
+    const statuses = ["NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "PENDING_CANCEL", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "LOST"];
+    for (const name of ["list_orders", "list_bot_orders"]) {
+      // Optional, so the enum's list is one wrapper in.
+      const status = named(name).input.status as unknown as {
+        unwrap(): { options: readonly string[] };
+        safeParse(v: unknown): { success: boolean };
+      };
+      expect([...status.unwrap().options], name).toEqual(statuses);
+      expect(status.safeParse("filled").success, name).toBe(false);
+      expect(status.safeParse("OPEN").success, name).toBe(false);
+      expect(status.safeParse(undefined).success, name).toBe(true);
+    }
+  });
+
+  it("takes no arguments on list_open_orders, whose route reads no query, and says where the filters are", () => {
+    const open = named("list_open_orders");
+    expect(Object.keys(open.input)).toEqual([]);
+    expect(open.query).toBeUndefined();
+    expect(open.description).toMatch(/filter the result yourself, or use list_orders/);
+  });
+
+  it("offers since and until on one bot's orders and analytics, which the API reads", () => {
+    for (const name of ["list_bot_orders", "get_bot_analytics"]) {
+      const endpoint = named(name);
+      expect(endpoint.query, name).toEqual(expect.arrayContaining(["since", "until"]));
+      expect(Object.keys(endpoint.input), name).toEqual(expect.arrayContaining(["since", "until"]));
+      expect(described(endpoint, "since"), name).toMatch(/RFC 3339/);
+    }
+  });
+
+  it("accepts a loss limit as a bare number or the object form, and names max_loss", () => {
+    for (const name of ["create_bot", "update_bot_config"]) {
+      const killSwitch = named(name).input.killSwitch;
+      expect(described(named(name), "killSwitch"), name).toMatch(/max_loss/);
+      expect(killSwitch?.safeParse(250).success, name).toBe(true);
+      expect(killSwitch?.safeParse(0).success, name).toBe(true);
+      expect(killSwitch?.safeParse({ currency: "USDT", max_loss: 250, limits: { "binance_spot:BTCUSDT": 100 } }).success, name).toBe(true);
+      expect(killSwitch?.safeParse(undefined).success, name).toBe(true);
+      expect(killSwitch?.safeParse("250").success, name).toBe(false);
+    }
+    expect(named("get_bot_config").description).toMatch(/max_loss/);
+  });
+
+  it("offers every order type the reference publishes, in its spelling, so stopPrice has an order to go on", () => {
+    // Copied by hand from the reference page's place-order `type` row.
+    const types = ["LIMIT", "MARKET", "LIMIT_MAKER", "STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"];
+    const place = named("place_order");
+    const type = place.input.type as unknown as { options: readonly string[]; safeParse(v: unknown): { success: boolean } };
+    expect([...type.options]).toEqual(types);
+    expect(type.safeParse("market").success).toBe(false);
+
+    expect(described(place, "stopPrice")).toMatch(/Required for STOP_LOSS, STOP_LOSS_LIMIT, TAKE_PROFIT and TAKE_PROFIT_LIMIT/);
+    expect(described(place, "price")).toMatch(/Required for LIMIT, LIMIT_MAKER, STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT/);
+    expect(described(place, "quoteQuantity")).toMatch(/only with MARKET/);
+
+    const timeInForce = place.input.timeInForce;
+    for (const t of ["GTC", "IOC", "FOK", undefined]) expect(timeInForce?.safeParse(t).success, String(t)).toBe(true);
+    expect(timeInForce?.safeParse("DAY").success).toBe(false);
+  });
+
+  it("puts a bot's name in a path as the API stores it: trimmed and lower-cased", () => {
+    // The API lower-cases a bot's name when it creates one and derives the
+    // workload from exactly what the path says, so "Alpha" addresses nothing and
+    // a stop answers 204 while the bot keeps trading.
+    const botPaths = ENDPOINTS.filter((e) => e.path.startsWith("/v1/bots/{name}"));
+    expect(botPaths.map((e) => e.name).sort()).toEqual(
+      ["get_bot_analytics", "get_bot_config", "list_bot_orders", "stop_bot", "update_bot_config"].sort(),
+    );
+    for (const endpoint of botPaths) {
+      const name = endpoint.input.name;
+      expect(name?.parse(" Alpha "), endpoint.name).toBe("alpha");
+      expect(name?.safeParse("   ").success, endpoint.name).toBe(false);
+    }
+  });
+
+  it("filters orders by a bot's name as the API stores it", () => {
+    // The API matches the filter exactly against the lower-cased name, so "Alpha"
+    // would list no history and cancel nothing.
+    const filtered = ENDPOINTS.filter((e) => e.input.bot !== undefined);
+    expect(filtered.map((e) => e.name).sort()).toEqual(["cancel_orders", "list_orders"]);
+    for (const endpoint of filtered) {
+      expect(endpoint.input.bot?.parse(" Alpha "), endpoint.name).toBe("alpha");
+      expect(endpoint.input.bot?.parse(undefined), endpoint.name).toBeUndefined();
+    }
+  });
+
+  it("leaves a script's name as typed, because the API keeps its case", () => {
+    for (const endpoint of ENDPOINTS.filter((e) => e.path.startsWith("/v1/scripts/{name}"))) {
+      expect(endpoint.input.name?.parse("BTC Grid"), endpoint.name).toBe("BTC Grid");
     }
   });
 });

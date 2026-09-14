@@ -68,6 +68,12 @@ describe("prepare", () => {
     expect(prepared.path).toBe("/v1/bots/alpha/config");
     expect(JSON.parse(new TextDecoder().decode(prepared.body))).toEqual({ config: { size: 2 } });
   });
+
+  it("sends update_script's name in the path and the body, which the API refuses without", () => {
+    const prepared = prepare(endpoint("update_script"), { name: "BTC Grid", script: "return 1" });
+    expect(prepared.path).toBe("/v1/scripts/BTC%20Grid");
+    expect(JSON.parse(new TextDecoder().decode(prepared.body))).toEqual({ name: "BTC Grid", script: "return 1" });
+  });
 });
 
 describe("the address a request is dialled at", () => {
@@ -121,8 +127,8 @@ describe("call", () => {
     const response = await call(config, endpoint("place_order"), {
       exchange: "binance_spot",
       symbol: "BTCUSDT",
-      side: "buy",
-      type: "limit",
+      side: "BUY",
+      type: "LIMIT",
       quantity: "0.001",
       price: "60000",
     });
@@ -133,8 +139,8 @@ describe("call", () => {
     expect(JSON.parse(sent?.body ?? "")).toEqual({
       exchange: "binance_spot",
       symbol: "BTCUSDT",
-      side: "buy",
-      type: "limit",
+      side: "BUY",
+      type: "LIMIT",
       quantity: "0.001",
       price: "60000",
     });
@@ -145,6 +151,20 @@ describe("call", () => {
     await call(config, endpoint("list_orders"), { symbol: "BTCUSDT", limit: 10 });
     const sent = api.requests.at(-1);
     expect(sent?.query).toBe("symbol=BTCUSDT&limit=10");
+  });
+
+  it("signs a time window on one bot's analytics, which the API reads", async () => {
+    api.route("GET /v1/bots/alpha/analytics", { body: { summary: {}, series: [] } });
+    await call(config, endpoint("get_bot_analytics"), {
+      name: "alpha",
+      since: "2026-09-01T00:00:00Z",
+      until: "2026-09-08T00:00:00Z",
+    });
+    const sent = api.requests.at(-1);
+    expect(Object.fromEntries(new URLSearchParams(sent?.query))).toEqual({
+      since: "2026-09-01T00:00:00Z",
+      until: "2026-09-08T00:00:00Z",
+    });
   });
 
   it("sends no Content-Type when there is no body", async () => {
@@ -252,6 +272,14 @@ describe("errors", () => {
     await expect(call(config, endpoint("list_positions"), {})).rejects.toThrow(
       /HTTP 404: .*deployment does not serve that endpoint/,
     );
+  });
+
+  it("says a deployment with no stream list has no list, not that a stream is missing", async () => {
+    // The list is only mounted where live streams are offered to keys, so there
+    // is no resource behind it to be "not found".
+    const failure = await call(config, endpoint("list_streams"), {}).catch((e) => e);
+    expect(failure).toBeInstanceOf(RequestError);
+    expect((failure as RequestError).message).toBe("not found (HTTP 404: no stream list is available on this deployment)");
   });
 
   it("carries the status on the error for a caller that wants to branch", async () => {

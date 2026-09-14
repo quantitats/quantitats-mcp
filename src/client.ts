@@ -224,7 +224,7 @@ export async function call(
   const rateLimit = readRateLimit(response.headers);
 
   if (!response.ok) {
-    throw new RequestError(response.status, explain(response.status, data, rateLimit), url);
+    throw new RequestError(response.status, explain(endpoint, response.status, data, rateLimit), url);
   }
   return { status: response.status, data, ...(rateLimit ? { rateLimit } : {}) };
 }
@@ -238,8 +238,12 @@ export async function call(
  * usually a scope the key was never granted rather than anything to do with what
  * the account is allowed to do, and a 404 is as often an endpoint this
  * deployment does not serve as it is a missing bot.
+ *
+ * The stream list has no resource to be missing: it is mounted only where live
+ * streams are offered to keys, so its 404 says that rather than "no such
+ * resource", which would send a model looking for a stream that was never there.
  */
-function explain(status: number, data: unknown, rateLimit?: RateLimitState): string {
+function explain(endpoint: Endpoint, status: number, data: unknown, rateLimit?: RateLimitState): string {
   const server =
     data !== null && typeof data === "object" && "error" in data && typeof (data as { error: unknown }).error === "string"
       ? (data as { error: string }).error
@@ -256,7 +260,9 @@ function explain(status: number, data: unknown, rateLimit?: RateLimitState): str
       case 403:
         return "the key is missing the scope this endpoint needs, or the endpoint cannot be used with an API key at all";
       case 404:
-        return "no such resource, or this deployment does not serve that endpoint";
+        return endpoint.name === "list_streams"
+          ? "no stream list is available on this deployment"
+          : "no such resource, or this deployment does not serve that endpoint";
       case 409:
         return "that name is already in use";
       case 429:

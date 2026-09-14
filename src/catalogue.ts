@@ -15,6 +15,24 @@ import { BUCKETS, type Bucket } from "./ratelimits.ts";
  * that advertises a tool the key cannot reach costs a caller more than no tool
  * at all — the model spends a call to learn what the manifest could have said.
  *
+ * The argument schemas are the API's vocabulary, not a friendlier one. Where the
+ * API is strict — an order filter's side and status, a bot's name in a path —
+ * a looser schema here does not make a call easier, it makes it silently wrong:
+ * a lower-case status filter is a 400, and a stop addressed to "Alpha" is a 204
+ * that stopped nothing. So each schema says exactly what the handler accepts:
+ *
+ *   - update_script sends `name` in the body as well as the path. The API reads
+ *     the target name from the body (a rename is the same request) and refuses a
+ *     body without one.
+ *   - `side` is BUY or SELL, and `status` the API's closed, case-sensitive list.
+ *   - list_open_orders takes no arguments, because its route reads no query.
+ *   - list_bot_orders and get_bot_analytics take since and until, which they read.
+ *   - A loss limit is a bare number or the object form, and the object's overall
+ *     figure is `max_loss` — snake_case inside a camelCase body.
+ *   - place_order offers every order type and time in force the API places, so
+ *     `stopPrice` has an order it can be used on.
+ *   - A bot's name is trimmed and lower-cased before it reaches a path.
+ *
  * What is deliberately absent: stored venue keys, API keys themselves, plan and
  * billing, and administration. No scope grants those, by design — a key can use
  * stored venue keys to trade and can never read or replace one, so a leaked key
@@ -55,18 +73,85 @@ export const VENUES = [
   "coinbase_advanced",
 ] as const;
 
+/**
+ * The order statuses the API filters on — exact, upper-case, and nothing else.
+ * Any other spelling, "filled" included, is refused with a 400.
+ */
+export const ORDER_STATUSES = [
+  "NEW",
+  "PARTIALLY_FILLED",
+  "FILLED",
+  "CANCELED",
+  "PENDING_CANCEL",
+  "REJECTED",
+  "EXPIRED",
+  "EXPIRED_IN_MATCH",
+  "LOST",
+] as const;
+
+/** An order's side, in the API's spelling. The order filters refuse anything else. */
+const SIDES = ["BUY", "SELL"] as const;
+
+/**
+ * The order types the API places — its whole list, in its spelling. Upper case
+ * like SIDES and the endpoint reference: a lower-case transform in front would
+ * drop the list from the schema a model reads.
+ */
+export const ORDER_TYPES = [
+  "LIMIT",
+  "MARKET",
+  "LIMIT_MAKER",
+  "STOP_LOSS",
+  "STOP_LOSS_LIMIT",
+  "TAKE_PROFIT",
+  "TAKE_PROFIT_LIMIT",
+] as const;
+
+/** How long an order stands. Absent means the venue's default. */
+const TIMES_IN_FORCE = ["GTC", "IOC", "FOK"] as const;
+
 const venue = z.enum(VENUES).describe("Venue id, e.g. binance_spot. The market half of the name is part of it.");
 const symbol = z.string().min(1).describe("Instrument symbol as the venue lists it, e.g. BTCUSDT.");
-const botName = z.string().min(1).describe("The bot's name.");
+/**
+ * Trimmed and lower-cased before the path is built, as the API stores a bot's
+ * name. The API answers a stop for a name it cannot form with 204 and does
+ * nothing, so "Alpha" sent as it was typed would report a stopped bot that is
+ * still trading. In this zod, trim and toLowerCase are string checks that
+ * rewrite the value rather than transforms, so the advertised schema stays a
+ * plain string and the SDK hands the tool the rewritten value.
+ */
+const botName = z.string().trim().toLowerCase().min(1).describe("The bot's name, as list_bots or create_bot answered it.");
 const scriptName = z.string().min(1).describe("The script's name.");
+/**
+ * A free-form settings object, built fresh at every use. One shared instance
+ * would be converted once and then referenced: the manifest would describe a loss
+ * limit as `$ref: #/properties/sim`, which not every client resolves.
+ */
+const settings = () => z.record(z.unknown());
+
+/**
+ * A loss limit: a bare number for every market, or the object form. The object's
+ * overall figure is `max_loss`, snake_case inside a camelCase body, which is the
+ * mistake worth describing.
+ */
+function lossLimit(description: string) {
+  return z.union([z.number(), settings()]).optional().describe(description);
+}
+
+/**
+ * A bot filter on the account's orders. The API compares it exactly against the
+ * stored, lower-cased name, so "Alpha" would match nothing: an empty history, or
+ * a cancel-all that cancelled nothing.
+ */
+const botFilter = z.string().trim().toLowerCase().optional();
 
 /** Shared order-history filters. Every field narrows; all are optional. */
 const orderFilters = {
-  status: z.string().optional().describe("Order status to filter by."),
+  status: z.enum(ORDER_STATUSES).optional().describe("Only orders in this status."),
   symbol: z.string().optional().describe("Only orders for this symbol."),
-  side: z.enum(["buy", "sell"]).optional().describe("Only orders on this side."),
+  side: z.enum(SIDES).optional().describe("Only orders on this side: BUY or SELL."),
   exchange: z.enum(VENUES).optional().describe("Only orders on this venue."),
-  bot: z.string().optional().describe("Only orders placed by this bot."),
+  bot: botFilter.describe("Only orders placed by this bot."),
   origin: z.enum(["manual", "bot"]).optional().describe("Placed by hand, or by a strategy."),
   since: z.string().optional().describe("RFC 3339 lower bound on placement time."),
   until: z.string().optional().describe("RFC 3339 upper bound on placement time."),
@@ -79,7 +164,9 @@ const orderFilters = {
  *
  * `path` is a template over the argument names; `query` and `body` name which
  * arguments travel where. An argument named in neither is a path parameter, and
- * client.ts checks that rather than trusting it.
+ * client.ts checks that rather than trusting it. A path parameter may also be
+ * named in `body` when the API reads it from both — update_script's name is the
+ * one that does.
  */
 export type Endpoint = {
   readonly name: string;
@@ -130,28 +217,28 @@ export const ENDPOINTS: readonly Endpoint[] = [
     description:
       "Creates and starts a bot running one of the account's scripts. Answers 409 if the name is taken and 403 " +
       "if the plan's bot limit is reached, naming the limit. Mode defaults to paper; sim settings are refused on " +
-      "a live bot rather than ignored.",
+      "a live bot rather than ignored. A live bot trades real funds.",
     scope: "bots:write",
     method: "POST",
     path: "/v1/bots",
     write: true,
     input: {
-      name: z.string().min(1).describe("Name for the new bot. Must be unused."),
+      name: z
+        .string()
+        .min(1)
+        .describe("Name for the new bot. Must be unused. Stored lower-cased; later tools take the name this answers with."),
       script: scriptName,
       exchanges: z.array(venue).min(1).describe("Venues this bot trades on."),
       mode: z.enum(["paper", "live"]).optional().describe("Paper simulates; live trades real funds. Defaults to paper."),
-      config: z
-        .record(z.unknown())
+      config: settings()
         .optional()
         .describe("Overrides for the script's own settings, for this bot only. Checked against the script."),
-      sim: z
-        .record(z.unknown())
-        .optional()
-        .describe("Simulator settings, for a paper bot only. Refused on a live bot."),
-      killSwitch: z
-        .record(z.unknown())
-        .optional()
-        .describe("Per-market loss limit. The first market to exceed its limit ends the run for good."),
+      sim: settings().optional().describe("Simulator settings, for a paper bot only. Refused on a live bot."),
+      killSwitch: lossLimit(
+        "Per-market loss limit. A bare number is the limit for every market; the object form is " +
+          '{"currency": "USDT", "max_loss": 250, "limits": {"binance_spot:BTCUSDT": 100}} — note max_loss is ' +
+          "snake_case. The first market to exceed its limit ends the run for good.",
+      ),
     },
     body: ["name", "script", "exchanges", "mode", "config", "sim", "killSwitch"],
   },
@@ -174,7 +261,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
     title: "Read a bot's settings",
     description:
       "That bot's settings: the fields its script declares, the values this bot overrides, its run mode, its " +
-      "simulator settings if it is a paper bot, and its loss limit.",
+      "simulator settings if it is a paper bot, and its loss limit (a number, or an object with max_loss).",
     scope: "bots:read",
     method: "GET",
     path: "/v1/bots/{name}/config",
@@ -193,9 +280,12 @@ export const ENDPOINTS: readonly Endpoint[] = [
     write: true,
     input: {
       name: botName,
-      config: z.record(z.unknown()).describe("The complete set of overrides. Anything absent reverts to the script's value."),
-      sim: z.record(z.unknown()).optional().describe("Simulator settings, for a paper bot only."),
-      killSwitch: z.record(z.unknown()).optional().describe("Per-market loss limit. Omit or zero to switch it off."),
+      config: settings().describe("The complete set of overrides. Anything absent reverts to the script's value."),
+      sim: settings().optional().describe("Simulator settings, for a paper bot only."),
+      killSwitch: lossLimit(
+        "Per-market loss limit: a bare number, or an object whose overall figure is max_loss (snake_case). " +
+          "Omit it, or send 0, to switch the limit off.",
+      ),
     },
     body: ["config", "sim", "killSwitch"],
   },
@@ -203,7 +293,9 @@ export const ENDPOINTS: readonly Endpoint[] = [
     name: "list_bot_orders",
     bucket: BUCKETS.default,
     title: "List one bot's orders",
-    description: "Every order that bot has placed, open and historic. Readable even for a bot that has been stopped.",
+    description:
+      "Every order that bot has placed, open and historic, newest first. Readable even for a bot that has been " +
+      "stopped. An unknown bot answers with an empty list, not an error.",
     scope: "bots:read",
     method: "GET",
     path: "/v1/bots/{name}/orders",
@@ -212,20 +304,29 @@ export const ENDPOINTS: readonly Endpoint[] = [
       status: orderFilters.status,
       symbol: orderFilters.symbol,
       side: orderFilters.side,
+      since: orderFilters.since,
+      until: orderFilters.until,
       before: orderFilters.before,
       limit: orderFilters.limit,
     },
-    query: ["status", "symbol", "side", "before", "limit"],
+    query: ["status", "symbol", "side", "since", "until", "before", "limit"],
   },
   {
     name: "get_bot_analytics",
     bucket: BUCKETS.default,
     title: "Read one bot's performance",
-    description: "That bot's realized profit and loss and its fill statistics.",
+    description:
+      "That bot's realized profit and loss and its fill statistics, optionally over a time window. Money " +
+      "figures are decimal strings keyed by asset or symbol; add two together only when they share one.",
     scope: "bots:read",
     method: "GET",
     path: "/v1/bots/{name}/analytics",
-    input: { name: botName },
+    input: {
+      name: botName,
+      since: z.string().optional().describe("RFC 3339 lower bound. Absent means no lower bound."),
+      until: z.string().optional().describe("RFC 3339 upper bound. Absent means no upper bound."),
+    },
+    query: ["since", "until"],
   },
 
   // --- Market data ---------------------------------------------------------
@@ -272,19 +373,12 @@ export const ENDPOINTS: readonly Endpoint[] = [
     title: "List open orders",
     description:
       "Every order across the account that can still trade, from bots and from manual placement alike, each " +
-      "one carrying which bot placed it. This is the account's own view of the book.",
+      "one carrying which bot placed it. This is the account's own view of the book. It takes no filters: " +
+      "filter the result yourself, or use list_orders, which does filter.",
     scope: "trade:read",
     method: "GET",
     path: "/v1/trade/orders/open",
-    input: {
-      status: orderFilters.status,
-      symbol: orderFilters.symbol,
-      side: orderFilters.side,
-      exchange: orderFilters.exchange,
-      bot: orderFilters.bot,
-      origin: orderFilters.origin,
-    },
-    query: ["status", "symbol", "side", "exchange", "bot", "origin"],
+    input: {},
   },
   {
     name: "list_orders",
@@ -316,9 +410,10 @@ export const ENDPOINTS: readonly Endpoint[] = [
     bucket: BUCKETS.tradeWrite,
     title: "Place an order",
     description:
-      "Submits one order and answers with it as the venue acknowledged it. Quantities and prices are decimal " +
-      "STRINGS, not numbers, so nothing is lost to floating point. A limit order needs a price. Check " +
-      "list_instruments first: a price or size off the venue's grid is refused.",
+      "Submits one order with real funds and answers with it as the venue acknowledged it. Quantities and " +
+      "prices are decimal STRINGS, not numbers, so nothing is lost to floating point. A LIMIT order needs a " +
+      "price; a stop or take-profit order needs a stopPrice. Check list_instruments first: a price or size off " +
+      "the venue's grid is refused.",
     scope: "trade:write",
     method: "POST",
     path: "/v1/trade/orders",
@@ -326,13 +421,22 @@ export const ENDPOINTS: readonly Endpoint[] = [
     input: {
       exchange: venue,
       symbol,
-      side: z.enum(["buy", "sell"]),
-      type: z.enum(["market", "limit"]).describe("Order type."),
+      side: z.enum(SIDES).describe("BUY or SELL."),
+      type: z.enum(ORDER_TYPES).describe("Order type."),
       quantity: z.string().optional().describe("Size in the base asset, as a decimal string."),
-      quoteQuantity: z.string().optional().describe("Size in the quote asset, as a decimal string. An alternative to quantity."),
-      price: z.string().optional().describe("Limit price, as a decimal string. Required for a limit order."),
-      stopPrice: z.string().optional().describe("Trigger price, as a decimal string."),
-      timeInForce: z.string().optional().describe("How long the order stands, e.g. GTC or IOC."),
+      quoteQuantity: z
+        .string()
+        .optional()
+        .describe("Size in the quote asset, as a decimal string. An alternative to quantity, valid only with MARKET."),
+      price: z
+        .string()
+        .optional()
+        .describe("Limit price, as a decimal string. Required for LIMIT, LIMIT_MAKER, STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT."),
+      stopPrice: z
+        .string()
+        .optional()
+        .describe("Trigger price, as a decimal string. Required for STOP_LOSS, STOP_LOSS_LIMIT, TAKE_PROFIT and TAKE_PROFIT_LIMIT."),
+      timeInForce: z.enum(TIMES_IN_FORCE).optional().describe("How long the order stands. Absent means the venue's default."),
       reduceOnly: z.boolean().optional().describe("Only meaningful on a derivative venue."),
     },
     body: ["exchange", "symbol", "side", "type", "quantity", "quoteQuantity", "price", "stopPrice", "timeInForce", "reduceOnly"],
@@ -366,7 +470,7 @@ export const ENDPOINTS: readonly Endpoint[] = [
       exchange: z.enum(VENUES).optional().describe("Only orders on this venue."),
       symbol: z.string().optional().describe("Only orders for this symbol."),
       origin: z.enum(["manual", "bot"]).optional().describe("Only orders placed by hand, or only those placed by a strategy."),
-      bot: z.string().optional().describe("Only orders placed by this bot."),
+      bot: botFilter.describe("Only orders placed by this bot."),
     },
     query: ["exchange", "symbol", "origin", "bot"],
   },
@@ -424,14 +528,18 @@ export const ENDPOINTS: readonly Endpoint[] = [
     bucket: BUCKETS.controlPlane,
     title: "Replace a script",
     description:
-      "Replaces a script's source. Bots already running it keep running the version they started with until " +
-      "they are restarted.",
+      "Replaces a script's whole source. Bots already running it keep running the version they started with " +
+      "until they are restarted. An edit that changes the settings the script declares is refused with a 409; " +
+      "save it under a new name instead.",
     scope: "scripts:write",
     method: "PUT",
     path: "/v1/scripts/{name}",
     write: true,
     input: { name: scriptName, script: z.string().describe("The new source, replacing what is stored.") },
-    body: ["script"],
+    // The name travels twice. The path says which script; the API reads the name
+    // it should end up with from the body, refuses a body without one, and would
+    // rename the script to anything else — so the same value goes in both.
+    body: ["name", "script"],
   },
   {
     name: "delete_script",
